@@ -1,8 +1,7 @@
-// src/utils/price.js
 function parsePriceGBP(str) {
   if (typeof str === 'number') return { amount: str, currency: 'GBP' };
   if (!str) return { amount: null, currency: 'GBP' };
-  const m = String(str).replace(',', '').match(/(£|GBP)?\s*(\d+(?:\.\d{1,2})?)/i);
+  const m = String(str).replace(/,/g, '').match(/(£|GBP)?\s*(\d+(?:\.\d{1,2})?)/i);
   if (!m) return { amount: null, currency: 'GBP' };
   const amount = parseFloat(m[2]);
   return { amount, currency: 'GBP' };
