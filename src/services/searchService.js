@@ -54,14 +54,12 @@ function uniqKey(r) {
 
 /* ---------- active sources from scrapingService ---------- */
 function getActiveSources(requested) {
-  // Bind methods to preserve `this` inside ScrapingService class methods
-  const S = scrapingService;
+  const S = scrapingService; // preserve `this` on bound methods
   const maybe = [
     ['ebay',            S.searchEbay.bind(S)],
     ['gumtree',         S.searchGumtree.bind(S)],
     ['cashConverters',  S.searchCashConverters.bind(S)],
     ['facebook',        S.searchFacebookMarketplace.bind(S)],
-    // Enable only if implemented:
     ['vinted',          S.searchVinted?.bind(S)],
     ['depop',           S.searchDepop?.bind(S)],
     ['discogs',         S.searchDiscogs?.bind(S)],
@@ -81,6 +79,12 @@ class SearchService {
     this.maxConcurrency = Number(process.env.MAX_CONCURRENCY || 4);
   }
 
+  /**
+   * options:
+   *  - sources?: string[]
+   *  - maxPages?: number
+   *  - ukOnly?: boolean   // <-- set from the UI toggle
+   */
   async performSearch(searchTerm, location = 'UK', currency = 'GBP', options = {}) {
     const startedAt = Date.now();
 
@@ -103,7 +107,7 @@ class SearchService {
     const sources = getActiveSources(options.sources);
     const limit = pLimit(this.maxConcurrency);
 
-    // 3) Fire scrapes (per term x source), but never crash on a single failure
+    // 3) Scrape (per term x source)
     const jobs = [];
     for (const t of terms) {
       for (const [key, fn] of sources) {
@@ -121,7 +125,19 @@ class SearchService {
       }
     }
     const settled = await Promise.all(jobs);
-    const all = settled.flat().filter(Boolean);
+
+    // 3b) Flatten and optionally UK-filter BEFORE dedupe/ranking
+    let all = settled.flat().filter(Boolean);
+
+    const ukOnly =
+      options.ukOnly === true ||
+      String(location || '').toUpperCase() === 'UK';
+
+    if (ukOnly) {
+      const before = all.length;
+      all = scrapingService.filterUKOnly(all);
+      logger.info(`🇬🇧 UK-only filter applied: ${before} -> ${all.length}`);
+    }
 
     if (!all.length) {
       logger.warn('⚠️ No results from any source');
@@ -172,8 +188,6 @@ class SearchService {
 
     const top = scored.sort((a, b) => b.score - a.score).slice(0, 40);
 
-    // 6) (Optional) currency conversion – keep your simple approach here if needed
-    // For now, just return as-is in GBP-style strings.
     logger.info(`✅ Returning ${top.length} results in ${Date.now() - startedAt}ms`);
     return top;
   }
