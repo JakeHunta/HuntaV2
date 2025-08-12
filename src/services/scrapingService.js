@@ -16,12 +16,15 @@ class ScrapingService {
   /**
    * Fetch a page through ScrapingBee and return Cheerio $
    */
-  async fetchHTML(url, {
-    render_js = false,
-    wait = 0,
-    premium_proxy = true,
-    block_resources = true,
-  } = {}) {
+  async fetchHTML(
+    url,
+    {
+      render_js = false,
+      wait = 0,
+      premium_proxy = true,
+      block_resources = true,
+    } = {}
+  ) {
     if (!this.scrapingBeeApiKey) {
       throw new Error('SCRAPINGBEE_API_KEY missing');
     }
@@ -42,19 +45,58 @@ class ScrapingService {
     return cheerio.load(res.data);
   }
 
+  // -----------------------------
+  // Helpers / Normalization
+  // -----------------------------
+
+  // Detect currency from a price string
+  detectCurrency(price = '') {
+    if (/[£]/.test(price)) return 'GBP';
+    if (/[$]/.test(price)) return 'USD';
+    if (/[€]/.test(price)) return 'EUR';
+    return null;
+  }
+
+  // Heuristic: does a text look like "UK"?
+  isUKLocation(text = '') {
+    return /(united kingdom|^uk$|\buk\b|england|scotland|wales|northern ireland|great britain|\bgb\b)/i.test(
+      String(text).trim()
+    );
+  }
+
+  // Force higher-res eBay thumbnails (e.g. .../s-l64.jpg -> /s-l500.jpg)
+  upgradeEbayImage(url = '') {
+    if (!url) return url;
+    return url.replace(/\/s-l\d+\.jpg(\?.*)?$/i, '/s-l500.jpg');
+    // If you want maximum quality, change to s-l1600.jpg
+  }
+
   /**
    * Normalize a listing object to a consistent shape
    */
-  normalize({ title, price, link, image, source, description = '', postedAt = null }) {
+  normalize({
+    title,
+    price,
+    link,
+    image,
+    source,
+    description = '',
+    postedAt = null,
+    location = '',
+  }) {
     if (!title || !link) return null;
+
+    const cleanedPrice = this.cleanPrice(price || '');
     return {
       title: this.cleanTitle(title),
-      price: this.cleanPrice(price || ''),
+      price: cleanedPrice,
+      currency: this.detectCurrency(cleanedPrice), // NEW
       link,
       image: image || '',
       source,
       description: description || this.cleanTitle(title),
       postedAt,
+      location, // NEW
     };
   }
 
@@ -62,11 +104,12 @@ class ScrapingService {
     if (!url && $item) {
       const srcset = $item.find('.s-item__image img').attr('srcset');
       if (srcset) {
-        const candidates = srcset.split(',').map(s => s.trim().split(' ')[0]);
-        const highRes = candidates.find(c => c.includes('_1280.jpg'))
-          || candidates.find(c => c.includes('_640.jpg'))
-          || candidates.find(c => c.includes('_500.jpg'))
-          || candidates[candidates.length - 1];
+        const candidates = srcset.split(',').map((s) => s.trim().split(' ')[0]);
+        const highRes =
+          candidates.find((c) => c.includes('_1280.jpg')) ||
+          candidates.find((c) => c.includes('_640.jpg')) ||
+          candidates.find((c) => c.includes('_500.jpg')) ||
+          candidates[candidates.length - 1];
         if (highRes) return highRes;
       }
       const dataSrc = $item.find('.s-item__image img').attr('data-src');
@@ -82,6 +125,24 @@ class ScrapingService {
     return url;
   }
 
+  // Public helper: filter an array to UK-only results (use in your search service)
+  filterUKOnly(items = []) {
+    const isUK = (txt = '') => this.isUKLocation(txt);
+    return items.filter((it) => {
+      // currency must be GBP if present
+      if (it.currency && it.currency !== 'GBP') return false;
+
+      // if we have a location string (esp. eBay), enforce it
+      if (it.location && !isUK(it.location)) return false;
+
+      // UK-native sources are fine
+      if (['gumtree', 'cashConverters'].includes(it.source)) return true;
+
+      // For others (facebook, depop, vinted, etc.), GBP filter above is usually enough
+      return true;
+    });
+  }
+
   // -----------------------------
   // eBay
   // -----------------------------
@@ -95,7 +156,9 @@ class ScrapingService {
 
       const listings = [];
       for (let p = 1; p <= Math.max(1, maxPages); p++) {
-        const url = `https://www.ebay.co.uk/sch/i.html?_nkw=${encodeURIComponent(searchTerm)}&_sop=12&_fsrp=1&LH_PrefLoc=3&_pgn=${p}`;
+        const url = `https://www.ebay.co.uk/sch/i.html?_nkw=${encodeURIComponent(
+          searchTerm
+        )}&_sop=12&_fsrp=1&LH_PrefLoc=3&_pgn=${p}`;
         const $ = await this.fetchHTML(url, { render_js: false, premium_proxy: true });
 
         $('.s-item').each((_, el) => {
@@ -105,10 +168,18 @@ class ScrapingService {
           const link = $item.find('.s-item__link').attr('href');
           let image = $item.find('.s-item__image img').attr('src');
           image = this.improveEbayImageUrl(image, $item);
+          image = this.upgradeEbayImage(image); // NEW: crisper thumbs
+          const locationText = $item.find('.s-item__location, .s-item__itemLocation').text().trim(); // NEW
 
           if (!title || !link || /shop on ebay/i.test(title)) return;
           const norm = this.normalize({
-            title, price, link, image, source: 'ebay',
+            title,
+            price,
+            link,
+            image,
+            source: 'ebay',
+            description: title,
+            location: locationText, // NEW
           });
           if (norm) listings.push(norm);
         });
@@ -135,7 +206,9 @@ class ScrapingService {
 
       const listings = [];
       for (let p = 1; p <= Math.max(1, maxPages); p++) {
-        let url = `https://www.gumtree.com/search?search_category=all&q=${encodeURIComponent(searchTerm)}&page=${p}`;
+        let url = `https://www.gumtree.com/search?search_category=all&q=${encodeURIComponent(
+          searchTerm
+        )}&page=${p}`;
         if (location && location !== 'UK') url += `&search_location=${encodeURIComponent(location)}`;
 
         const $ = await this.fetchHTML(url, { render_js: true, premium_proxy: true });
@@ -143,13 +216,24 @@ class ScrapingService {
         $('[data-q="search-result"], .listing-link, .listing-item, [data-q="listing"]').each((_, el) => {
           const $item = $(el);
           let title = $item.find('h2 a, .listing-title, .listing-item-title, h2, h3').first().text().trim();
-          let price = $item.find('[itemprop=price], .listing-price, .price, .ad-price, .tilePrice').first().text().trim();
+          let price = $item
+            .find('[itemprop=price], .listing-price, .price, .ad-price, .tilePrice')
+            .first()
+            .text()
+            .trim();
           let link = $item.find('h2 a, a').first().attr('href');
           let image = $item.find('img').first().attr('src') || $item.find('img').first().attr('data-src');
           if (!title) title = $item.find('[data-q="listing-title"], .tileTitle').text().trim();
           if (link && link.startsWith('/')) link = `https://www.gumtree.com${link}`;
 
-          const norm = this.normalize({ title, price, link, image, source: 'gumtree' });
+          const norm = this.normalize({
+            title,
+            price,
+            link,
+            image,
+            source: 'gumtree',
+            location: 'United Kingdom', // UK site hint
+          });
           if (norm) listings.push(norm);
         });
       }
@@ -174,20 +258,33 @@ class ScrapingService {
 
       const listings = [];
       // Marketplace is dynamic; pagination via next pages is unreliable—do 1 page best-effort
-      const url = `https://www.facebook.com/marketplace/search/?query=${encodeURIComponent(searchTerm)}&exact=false`;
+      const url = `https://www.facebook.com/marketplace/search/?query=${encodeURIComponent(
+        searchTerm
+      )}&exact=false`;
       const $ = await this.fetchHTML(url, { render_js: true, premium_proxy: true, wait: 3500 });
 
-      // Prefer anchors with item pattern
       $('a[href*="/marketplace/item/"]').each((_, a) => {
         const linkRaw = a.attribs?.href || '';
         let link = linkRaw.startsWith('/') ? `https://www.facebook.com${linkRaw}` : linkRaw;
 
         const card = $(a).closest('[role=article], div');
         const title = card.find('span[dir="auto"]').first().text().trim() || $(a).text().trim();
-        const price = card.find('span').filter((i, el) => /[£$€]\s*\d/.test($(el).text())).first().text().trim();
+        const price = card
+          .find('span')
+          .filter((i, el) => /[£$€]\s*\d/.test($(el).text()))
+          .first()
+          .text()
+          .trim();
         const image = card.find('img').attr('src');
 
-        const norm = this.normalize({ title, price, link, image, source: 'facebook' });
+        const norm = this.normalize({
+          title,
+          price,
+          link,
+          image,
+          source: 'facebook',
+          // (optional) location: 'United Kingdom'
+        });
         if (norm) listings.push(norm);
       });
 
@@ -212,7 +309,9 @@ class ScrapingService {
 
       const listings = [];
       for (let p = 1; p <= Math.max(1, maxPages); p++) {
-        const url = `https://www.cashconverters.co.uk/search?q=${encodeURIComponent(searchTerm)}${p > 1 ? `&page=${p}` : ''}`;
+        const url = `https://www.cashconverters.co.uk/search?q=${encodeURIComponent(searchTerm)}${
+          p > 1 ? `&page=${p}` : ''
+        }`;
         const $ = await this.fetchHTML(url, { render_js: true, premium_proxy: true });
 
         $('.product-tile, .product').each((_, el) => {
@@ -223,7 +322,14 @@ class ScrapingService {
           const image = $item.find('img').attr('src') || $item.find('img').attr('data-src');
           if (link && link.startsWith('/')) link = `https://www.cashconverters.co.uk${link}`;
 
-          const norm = this.normalize({ title, price, link, image, source: 'cashConverters' });
+          const norm = this.normalize({
+            title,
+            price,
+            link,
+            image,
+            source: 'cashConverters',
+            location: 'United Kingdom', // UK site hint
+          });
           if (norm) listings.push(norm);
         });
       }
@@ -239,7 +345,6 @@ class ScrapingService {
   // -----------------------------
   // OPTIONAL SOURCES (enable when ready)
   // -----------------------------
-
   async searchVinted(searchTerm, location = 'UK', maxPages = 1) {
     try {
       logger.info(`🧥 Vinted: "${searchTerm}"`);
@@ -247,7 +352,9 @@ class ScrapingService {
 
       const listings = [];
       for (let p = 1; p <= Math.max(1, maxPages); p++) {
-        const url = `https://www.vinted.co.uk/catalog?search_text=${encodeURIComponent(searchTerm)}&page=${p}`;
+        const url = `https://www.vinted.co.uk/catalog?search_text=${encodeURIComponent(
+          searchTerm
+        )}&page=${p}`;
         const $ = await this.fetchHTML(url, { render_js: true, premium_proxy: true });
 
         // Try to find embedded state
@@ -257,19 +364,21 @@ class ScrapingService {
           try {
             const nuxt = JSON.parse(m[1]);
             const products = nuxt?.state?.products || [];
-            for (const p of products) {
+            for (const prod of products) {
               const norm = this.normalize({
-                title: p.title || p.name,
-                price: String(p?.price?.amount || p.price || ''),
-                link: p.url ? `https://www.vinted.co.uk${p.url}` : null,
-                image: p?.photo?.url || p?.image,
+                title: prod.title || prod.name,
+                price: String(prod?.price?.amount || prod.price || ''),
+                link: prod.url ? `https://www.vinted.co.uk${prod.url}` : null,
+                image: prod?.photo?.url || prod?.image,
                 source: 'vinted',
-                description: p?.description || ''
+                description: prod?.description || '',
               });
               if (norm) listings.push(norm);
             }
             continue;
-          } catch {}
+          } catch {
+            // ignore parse errors; fall back to DOM
+          }
         }
 
         // Fallback DOM parse
@@ -294,7 +403,7 @@ class ScrapingService {
   async searchDepop(searchTerm, location = 'UK', maxPages = 1) {
     try {
       logger.info(`🧢 Depop: "${searchTerm}"`);
-      if (!this.scrapingBeeApiKey) return [];
+    if (!this.scrapingBeeApiKey) return [];
 
       const listings = [];
       for (let p = 1; p <= Math.max(1, maxPages); p++) {
@@ -305,9 +414,14 @@ class ScrapingService {
           const link = `https://www.depop.com${a.attribs?.href || ''}`;
           const card = $(a).parent();
           const title = card.find('p').first().text().trim();
-          const price = card.find('span').filter((i, el) => /[£$€]\s*\d/.test($(el).text())).first().text().trim();
+          const price = card
+            .find('span')
+            .filter((i, el) => /[£$€]\s*\d/.test($(el).text()))
+            .first()
+            .text()
+            .trim();
           const image = card.find('img').attr('src');
-          const norm = this.normalize({ title, price, link, image, source: 'depop' });
+          const norm = this.normalize({ title, price, link, image, source: 'd epop' });
           if (norm) listings.push(norm);
         });
       }
@@ -326,14 +440,17 @@ class ScrapingService {
 
       const listings = [];
       for (let p = 1; p <= Math.max(1, maxPages); p++) {
-        const url = `https://www.discogs.com/sell/list?format=all&currency=GBP&q=${encodeURIComponent(searchTerm)}&page=${p}`;
+        const url = `https://www.discogs.com/sell/list?format=all&currency=GBP&q=${encodeURIComponent(
+          searchTerm
+        )}&page=${p}`;
         const $ = await this.fetchHTML(url, { render_js: false, premium_proxy: true });
 
         $('table#pjax_container tbody tr').each((_, tr) => {
           const title = $(tr).find('td.item_description a.item_description_title').text().trim();
           const link = 'https://www.discogs.com' + ($(tr).find('td.item_description a').attr('href') || '');
           const price = $(tr).find('td.price').text().trim();
-          const image = $(tr).find('td.image img').attr('data-src') || $(tr).find('td.image img').attr('src');
+          const image =
+            $(tr).find('td.image img').attr('data-src') || $(tr).find('td.image img').attr('src');
           const norm = this.normalize({ title, price, link, image, source: 'discogs' });
           if (norm) listings.push(norm);
         });
@@ -354,14 +471,21 @@ class ScrapingService {
       const listings = [];
       // Google is sensitive; keep pages low
       for (let p = 0; p < Math.min(1, maxPages); p++) {
-        const url = `https://www.google.com/search?tbm=shop&q=${encodeURIComponent(searchTerm)}&hl=en-GB&gl=gb`;
+        const url = `https://www.google.com/search?tbm=shop&q=${encodeURIComponent(
+          searchTerm
+        )}&hl=en-GB&gl=gb`;
         const $ = await this.fetchHTML(url, { render_js: true, premium_proxy: true });
 
         $('a[href^="/shopping/product/"]').each((_, a) => {
           const link = `https://www.google.com${a.attribs?.href || ''}`;
           const card = $(a).closest('div');
           const title = $(a).text().trim();
-          const price = card.find('span').filter((i, el) => /[£$€]\s*\d/.test($(el).text())).first().text().trim();
+          const price = card
+            .find('span')
+            .filter((i, el) => /[£$€]\s*\d/.test($(el).text()))
+            .first()
+            .text()
+            .trim();
           const image = card.find('img').attr('src');
           const norm = this.normalize({ title, price, link, image, source: 'googleShopping' });
           if (norm) listings.push(norm);
@@ -383,23 +507,30 @@ class ScrapingService {
       const listings = [];
       for (let p = 0; p < Math.max(1, maxPages); p++) {
         const start = p * 10;
-        const url = `https://www.google.com/search?q=${encodeURIComponent(searchTerm)}&num=10&start=${start}&hl=en-GB&gl=gb`;
+        const url = `https://www.google.com/search?q=${encodeURIComponent(
+          searchTerm
+        )}&num=10&start=${start}&hl=en-GB&gl=gb`;
         const $ = await this.fetchHTML(url, { render_js: true, premium_proxy: true });
 
         $('div.g').each((_, el) => {
           const a = $(el).find('a').first();
           const link = a.attr('href');
           const title = $(el).find('h3').first().text().trim();
-          const snippet = $(el).find('div[data-sncf]').text().trim()
-            || $(el).find('.VwiC3b').text().trim()
-            || $(el).find('.aCOpRe').text().trim()
-            || '';
+          const snippet =
+            $(el).find('div[data-sncf]').text().trim() ||
+            $(el).find('.VwiC3b').text().trim() ||
+            $(el).find('.aCOpRe').text().trim() ||
+            '';
 
           if (!link || !title) return;
 
           // Simple heuristic to keep likely product/listing pages
           const hay = `${title} ${snippet}`.toLowerCase();
-          if (!/(for sale|buy now|price|£|\$|€|in stock|add to cart|listing|shop|store|gumtree|ebay|facebook|depop|vinted|discogs|reverb)/.test(hay)) {
+          if (
+            !/(for sale|buy now|price|£|\$|€|in stock|add to cart|listing|shop|store|gumtree|ebay|facebook|depop|vinted|discogs|reverb)/.test(
+              hay
+            )
+          ) {
             return;
           }
 
@@ -409,7 +540,7 @@ class ScrapingService {
             link,
             image: '',
             source: 'googleResults',
-            description: snippet
+            description: snippet,
           });
           if (norm) listings.push(norm);
         });
@@ -449,7 +580,7 @@ class ScrapingService {
       status: error?.response?.status,
       statusText: error?.response?.statusText,
       code: error?.code,
-      url: error?.config?.url
+      url: error?.config?.url,
     };
   }
 
@@ -461,19 +592,23 @@ class ScrapingService {
       {
         title: `${searchTerm} - Excellent Condition`,
         price: '£150',
+        currency: 'GBP',
         link: 'https://www.gumtree.com/p/mock-listing-1',
         image: 'https://images.pexels.com/photos/1751731/pexels-photo-1751731.jpeg',
         source: 'gumtree',
-        description: `Used ${searchTerm} in excellent condition`
+        description: `Used ${searchTerm} in excellent condition`,
+        location: 'United Kingdom',
       },
       {
         title: `${searchTerm} - Good Deal`,
         price: '£120',
+        currency: 'GBP',
         link: 'https://www.gumtree.com/p/mock-listing-2',
         image: 'https://images.pexels.com/photos/1751731/pexels-photo-1751731.jpeg',
         source: 'gumtree',
-        description: `Second-hand ${searchTerm} at great price`
-      }
+        description: `Second-hand ${searchTerm} at great price`,
+        location: 'United Kingdom',
+      },
     ];
   }
 
@@ -482,11 +617,13 @@ class ScrapingService {
       {
         title: `${searchTerm} - eBay Special`,
         price: '£180',
+        currency: 'GBP',
         link: 'https://www.ebay.com/itm/mock-listing-1',
         image: 'https://images.pexels.com/photos/1751731/pexels-photo-1751731.jpeg',
         source: 'ebay',
-        description: `Pre-owned ${searchTerm} from eBay`
-      }
+        description: `Pre-owned ${searchTerm} from eBay`,
+        location: 'United Kingdom',
+      },
     ];
   }
 
@@ -495,11 +632,13 @@ class ScrapingService {
       {
         title: `${searchTerm} - Facebook Find`,
         price: '£100',
+        currency: 'GBP',
         link: 'https://www.facebook.com/marketplace/item/mock-listing-1',
         image: 'https://images.pexels.com/photos/1751731/pexels-photo-1751731.jpeg',
         source: 'facebook',
-        description: `Great ${searchTerm} from Facebook Marketplace`
-      }
+        description: `Great ${searchTerm} from Facebook Marketplace`,
+        location: 'United Kingdom',
+      },
     ];
   }
 
@@ -508,11 +647,13 @@ class ScrapingService {
       {
         title: `${searchTerm} - CashConverters Mock`,
         price: '£99',
+        currency: 'GBP',
         link: 'https://www.cashconverters.co.uk/mock-listing-1',
         image: 'https://images.pexels.com/photos/1751731/pexels-photo-1751731.jpeg',
         source: 'cashConverters',
-        description: `Mock listing for ${searchTerm} on CashConverters`
-      }
+        description: `Mock listing for ${searchTerm} on CashConverters`,
+        location: 'United Kingdom',
+      },
     ];
   }
 }
