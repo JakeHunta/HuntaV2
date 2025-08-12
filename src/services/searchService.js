@@ -5,8 +5,8 @@ import { scrapingService } from './scrapingService.js';
 import { logger } from '../utils/logger.js';
 
 /* ---------- config ---------- */
-const STRICT_MODE_DEFAULT = true;       // enforce must-have tokens
-const MAX_TERMS = 4;                    // fewer expansions = less drift
+const STRICT_MODE_DEFAULT = true;       // initial pass uses strict precision
+const MAX_TERMS = 4;                    // cap expansions to reduce drift
 const MAX_RESULTS = 40;
 
 /* ---------- weights ---------- */
@@ -22,23 +22,27 @@ const SOURCE_WEIGHTS = {
   googleResults: 0.6,
 };
 
-/* ---------- string utils ---------- */
+/* ---------- string & scoring utils ---------- */
 function normalizeText(s) { return (s || '').toLowerCase().replace(/\s+/g, ' ').trim(); }
+
 function parsePriceNumber(str) {
   if (typeof str === 'number') return str;
   if (!str) return null;
   const m = String(str).replace(/,/g, '').match(/(-?\d+(?:\.\d{1,2})?)/);
   return m ? parseFloat(m[1]) : null;
 }
+
 function median(nums) {
   const a = nums.slice().sort((x, y) => x - y);
   return a.length ? a[Math.floor(a.length / 2)] : null;
 }
+
 function priceClosenessScore(amount, med) {
   if (!amount || !med) return 0.5;
   const diffPct = Math.abs(amount - med) / (med + 1e-6);
   return Math.max(0, 1 - Math.min(1, diffPct));
 }
+
 function recencyScore(iso) {
   if (!iso) return 0.5;
   const ts = Date.parse(iso); if (Number.isNaN(ts)) return 0.5;
@@ -49,6 +53,7 @@ function recencyScore(iso) {
   if (days <= 90) return 0.4;
   return 0.2;
 }
+
 function uniqKey(r) {
   const t = normalizeText(r?.title);
   const p = parsePriceNumber(r?.price);
@@ -58,108 +63,177 @@ function uniqKey(r) {
   return `${t}::${p ?? 'na'}::${host}`;
 }
 
-/* ---------- brand/domain heuristics ---------- */
+/* ---------- PRECISION HELPERS (generic, category-agnostic) ---------- */
+
+// normalize text for match checks
+function N(s = '') { return String(s).toLowerCase().replace(/\s+/g, ' ').trim(); }
+
+// tokens we generally want to ignore as must-haves
+const COMMON_STOP = new Set([
+  'the','a','an','and','or','with','for','of','to','in','on',
+  'card','tcg','pokemon','pokémon','guitar','effects','pedal','amp','amps'
+]);
+
+// Split query and pick core tokens (brand/model-ish); up to 3
+function extractCoreTokens(query) {
+  const raw = N(query)
+    .replace(/[’'`]/g, '')
+    .replace(/[^a-z0-9.\-\s]/g, ' ')
+    .split(/\s+/)
+    .filter(Boolean);
+
+  const scored = raw.map(t => {
+    let score = 0;
+    if (/\d/.test(t)) score += 2;                 // digits → model-ish
+    if (/[.-]/.test(t)) score += 1;               // hyphen/dot variants
+    if (t.length >= 4 && !COMMON_STOP.has(t)) score += 1;
+    if (/^[a-z]+[0-9]+[a-z0-9]*$/i.test(t)) score += 1; // alnum mixed
+    return { t, score };
+  });
+
+  const seen = new Set();
+  const uniq = scored.filter(x => (seen.has(x.t) ? false : (seen.add(x.t), true)));
+  uniq.sort((a,b) => (b.score - a.score) || (b.t.length - a.t.length));
+
+  return uniq
+    .filter(x => x.t && !COMMON_STOP.has(x.t))
+    .slice(0, 3)
+    .map(x => x.t);
+}
+
+// Build regex variants for a token (handles ob-1 / ob1 / ob.1 / ob 1)
+function tokenRegexes(tok) {
+  const safe = tok.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+  const flex = safe.replace(/[-.]/g, '[-. ]?'); // allow -, . or space or none
+  const joined = safe.replace(/[-. ]/g, '');    // remove separators
+
+  const arr = [
+    new RegExp(`\\b${flex}\\b`, 'i'),
+    new RegExp(`\\b${joined}\\b`, 'i')
+  ];
+
+  if (!/[-.\s]/.test(tok)) {
+    arr.push(new RegExp(`\\b${safe}\\b`, 'i'));
+  }
+
+  const seen = new Set();
+  return arr.filter(r => (seen.has(String(r)) ? false : (seen.add(String(r)), true)));
+}
+
+// very generic excludes that often cause false positives
+const EXCLUDE_PATTERNS = [
+  /\b(manual|instructions?|book(let)?|guide)\b/i,
+  /\b(box\s*only|case\s*only|empty\s*box)\b/i,
+  /\bposter|print|sticker|decal|skin(s)?\b/i,
+  /\bparts?\s*only|spares?\s*or\s*repairs?\b/i,
+  /\bclip\s*art|ai\s*image|wallpaper\b/i
+];
+
+function shouldExclude(title, desc) {
+  const hay = `${title} ${desc}`.toLowerCase();
+  return EXCLUDE_PATTERNS.some(re => re.test(hay));
+}
+
+// Optional: brand/model one-off helpers to reduce cross-model bleed for Strymon
 const STRYMON_MODELS = [
-  'ob-1','ob1','compadre','timeline','bigsky','bluesky','blue sky','mobius','el capistan','capistan',
+  'ob-1','ob1','ob 1',
+  'compadre','timeline','bigsky','bluesky','blue sky','mobius','el capistan','capistan',
   'deco','flint','lex','ola','brig','riverside','sunset','volante','dig','ojai','zuma',
   'iridium','nightsky','night sky','cloudburst','zelzah','ultraviolet','ultra violet'
-].map(normalizeText);
+].map(N);
 
 function detectBrand(q) {
-  const s = normalizeText(q);
+  const s = N(q);
   if (s.includes('strymon')) return 'strymon';
-  if (s.includes('pokemon') || s.includes('pokémon')) return 'pokemon';
+  if (/\bpok[eé]mon\b/.test(s)) return 'pokemon';
   return null;
 }
 
 function detectTargetModel(q) {
-  const s = normalizeText(q);
-  if (/ob[-\s]?1\b/.test(s)) return 'ob-1';
+  const s = N(q);
+  if (/\bob[-.\s]?1\b/.test(s)) return 'ob-1';
   return null;
 }
 
-/* ---------- must-have token extraction ---------- */
-const COMMON_STOP = new Set(['the','a','an','and','or','with','for','of','to','in','on','card','tcg','pokemon','pokémon','guitar','effects','pedal']);
+/**
+ * Generic precision filter with strict/relaxed modes + a couple of light domain heuristics.
+ * @param {Array} results - listings [{title, description, ...}]
+ * @param {string} query
+ * @param {object|null} enhanced - enhancedQuery (optional)
+ * @param {object} opts - { strict?: boolean, minHitsTitle?: number, minHitsRelaxed?: number }
+ */
+function precisionFilter(results, query, enhanced = null, opts = {}) {
+  const strict = opts.strict ?? true;
 
-function mustHaveTokensFromQuery(q) {
-  const s = normalizeText(q);
-  const tokens = s.split(/[^\w-]+/).filter(Boolean);
+  const core = extractCoreTokens(query);
 
-  const must = new Set();
+  // include a few single-word enhanced terms (avoid multi-word drift)
+  const extras = Array.isArray(enhanced?.search_terms)
+    ? enhanced.search_terms
+        .map(N)
+        .filter(t => t && !t.includes(' ') && t.length >= 3 && !COMMON_STOP.has(t))
+        .slice(0, 3)
+    : [];
 
-  // Keep the most distinctive long token
-  const long = tokens.filter(t => t.length >= 4 && !COMMON_STOP.has(t)).sort((a,b)=>b.length-a.length)[0];
-  if (long) must.add(long);
+  const toks = Array.from(new Set([...core, ...extras]));
+  if (!toks.length) return results;
 
-  // Hyphenated or model-like tokens: keep collapsed variants too
-  tokens.forEach(t => {
-    if (/^[a-z0-9]+-[a-z0-9]+$/.test(t)) {
-      must.add(t);
-      must.add(t.replace('-', ''));   // ob1 alongside ob-1
-    }
-  });
+  const regsPerTok = toks.map(tokenRegexes);
+  const minHitsTitle   = opts.minHitsTitle   ?? Math.min(2, regsPerTok.length);
+  const minHitsRelaxed = opts.minHitsRelaxed ?? Math.min(2, regsPerTok.length);
 
-  // SIR / Special Illustration Rare synonyms
-  if (/\bsir\b/i.test(q)) {
-    ['sir','special illustration rare','illustration rare','alt art','sar'].forEach(x => must.add(x));
-  }
-
-  // If query looks like a Pokémon name (single distinct word), keep it
-  // (e.g., "genesect sir" -> "genesect" must appear)
-  const first = tokens.find(t => !COMMON_STOP.has(t));
-  if (first) must.add(first);
-
-  // Brand/model specifics
-  if (detectBrand(q) === 'strymon') must.add('strymon');
-
-  return Array.from(must).map(normalizeText);
-}
-
-/* ---------- precision filter ---------- */
-function precisionFilter(items, query, enhanced, { strict = true } = {}) {
-  const must = mustHaveTokensFromQuery(query);
   const brand = detectBrand(query);
   const targetModel = detectTargetModel(query);
-  const exactPhrase = normalizeText(query).replace(/\s+/g, ' ').trim();
+  const wantsSIR = /\bsir\b/i.test(query); // Pokémon SIR users expect SIR/Alt Art/SAR content
 
-  return items.filter(r => {
-    const hay = normalizeText(`${r.title} ${r.description || ''}`);
+  const out = [];
+  for (const r of results) {
+    const title = N(r.title || '');
+    const desc  = N(r.description || '');
+    if (!title) continue;
+    if (shouldExclude(title, desc)) continue;
 
-    // Strict: every must-have token (or phrase) must be present
+    // Count how many core tokens match in title / in title+desc
+    let hitsTitle = 0, hitsRelaxed = 0;
+    regsPerTok.forEach(regs => {
+      if (regs.some(re => re.test(title))) hitsTitle += 1;
+      else if (regs.some(re => re.test(`${title} ${desc}`))) hitsRelaxed += 1;
+    });
+
     if (strict) {
-      for (const m of must) {
-        if (!m) continue;
-        if (!hay.includes(m)) return false;
-      }
+      if (hitsTitle < minHitsTitle) continue; // require K matches in TITLE
+    } else {
+      const total = hitsTitle + hitsRelaxed;
+      if (!(hitsTitle >= Math.max(1, minHitsRelaxed - 1) || total >= minHitsRelaxed)) continue;
     }
 
-    // Brand/model heuristics: if user asked Strymon OB-1,
-    // drop listings that mention other Strymon models but not OB-1.
+    // Strymon heuristic: if user requested OB-1, drop other Strymon models unless OB-1 present
     if (brand === 'strymon' && targetModel) {
-      const hasTarget = hay.includes('ob-1') || hay.includes('ob 1') || hay.includes('ob1');
-      const mentionsOtherModel = STRYMON_MODELS
-        .filter(m => m !== 'ob-1' && m !== 'ob1' && m !== 'ob 1')
-        .some(m => hay.includes(m));
-      if (!hasTarget && mentionsOtherModel) return false;
+      const hasTarget = /\bob[-.\s]?1\b/.test(`${title} ${desc}`);
+      const mentionsOther = STRYMON_MODELS
+        .filter(m => !/\bob[ .-]?1\b/.test(m))
+        .some(m => `${title} ${desc}`.includes(m));
+      if (!hasTarget && mentionsOther) continue;
     }
 
-    // Pokémon SIR: if "SIR" in query, require "sir" OR "special illustration rare"/"alt art"/"sar"
-    if (/\bsir\b/i.test(query)) {
-      const okSIR = hay.includes('sir') || hay.includes('special illustration rare') || hay.includes('illustration rare') || hay.includes('alt art') || /\bsar\b/.test(hay);
-      if (!okSIR) return false;
+    // Pokémon SIR heuristic: if "SIR" in query, require SIR/Alt Art/SAR phrasing
+    if (wantsSIR) {
+      const okSIR = /\bsir\b/.test(`${title} ${desc}`)
+        || /special illustration rare/.test(`${title} ${desc}`)
+        || /illustration rare/.test(`${title} ${desc}`)
+        || /\balt\s*art\b/.test(`${title} ${desc}`)
+        || /\bsar\b/.test(`${title} ${desc}`);
+      if (!okSIR) continue;
     }
 
-    // Optionally require the exact phrase if it’s reasonably specific (3+ chars)
-    if (strict && exactPhrase.length >= 3) {
-      // Don’t hard-require full phrase; but prefer titles that contain all key terms
-      // (we already enforced tokens above).
-    }
+    out.push(r);
+  }
 
-    return true;
-  });
+  return out;
 }
 
-/* ---------- active sources ---------- */
+/* ---------- active sources from scrapingService ---------- */
 function getActiveSources(requested) {
   const S = scrapingService;
   const maybe = [
@@ -188,9 +262,9 @@ class SearchService {
 
   async performSearch(searchTerm, location = 'UK', currency = 'GBP', options = {}) {
     const startedAt = Date.now();
-    const strict = options.strictMode ?? STRICT_MODE_DEFAULT;
+    const strictRequested = options.strictMode ?? STRICT_MODE_DEFAULT;
 
-    // 1) Enhance query (but keep expansions small)
+    // 1) Enhance query (keep expansions small)
     let enhanced;
     try {
       enhanced = await openaiService.enhanceSearchQuery(searchTerm);
@@ -245,10 +319,23 @@ class SearchService {
       unique.push({ ...r, priceAmount: parsePriceNumber(r.price) });
     }
 
-    // 5) Precision filtering (BIG win for accuracy)
-    const filtered = precisionFilter(unique, searchTerm, enhanced, { strict });
+    // 5) Precision filtering with automatic fallback (strict → relaxed → none)
+    let filtered = precisionFilter(unique, searchTerm, enhanced, { strict: strictRequested });
+    let mode = strictRequested ? 'strict' : 'relaxed';
+
+    if (!filtered.length && strictRequested) {
+      const relaxed = precisionFilter(unique, searchTerm, enhanced, { strict: false });
+      if (relaxed.length) {
+        filtered = relaxed;
+        mode = 'relaxed';
+      } else {
+        filtered = unique; // give *something* rather than nothing
+        mode = 'none';
+      }
+    }
+
     if (!filtered.length) {
-      logger.info('ℹ️ All candidates filtered out by precision rules; returning []');
+      logger.info(`ℹ️ precisionFilter produced 0 items (mode=${mode}); returning []`);
       return [];
     }
 
@@ -284,7 +371,7 @@ class SearchService {
 
     const top = scored.sort((a, b) => b.score - a.score).slice(0, MAX_RESULTS);
 
-    logger.info(`✅ Returning ${top.length} results in ${Date.now() - startedAt}ms (strict=${strict})`);
+    logger.info(`✅ Returning ${top.length} results in ${Date.now() - startedAt}ms (precision=${mode})`);
     return top;
   }
 
@@ -292,4 +379,3 @@ class SearchService {
 }
 
 export const searchService = new SearchService();
-
