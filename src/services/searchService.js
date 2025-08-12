@@ -54,16 +54,19 @@ function uniqKey(r) {
 
 /* ---------- active sources from scrapingService ---------- */
 function getActiveSources(requested) {
+  // Bind methods to preserve `this` inside ScrapingService class methods
+  const S = scrapingService;
   const maybe = [
-    ['ebay', scrapingService.searchEbay],
-    ['gumtree', scrapingService.searchGumtree],
-    ['cashConverters', scrapingService.searchCashConverters],
-    ['facebook', scrapingService.searchFacebookMarketplace],
-    ['vinted', scrapingService.searchVinted],
-    ['depop', scrapingService.searchDepop],
-    ['discogs', scrapingService.searchDiscogs],
-    ['googleShopping', scrapingService.searchGoogleShopping],
-    ['googleResults', scrapingService.searchGoogleResults],
+    ['ebay',            S.searchEbay.bind(S)],
+    ['gumtree',         S.searchGumtree.bind(S)],
+    ['cashConverters',  S.searchCashConverters.bind(S)],
+    ['facebook',        S.searchFacebookMarketplace.bind(S)],
+    // Enable only if implemented:
+    ['vinted',          S.searchVinted?.bind(S)],
+    ['depop',           S.searchDepop?.bind(S)],
+    ['discogs',         S.searchDiscogs?.bind(S)],
+    ['googleShopping',  S.searchGoogleShopping?.bind(S)],
+    ['googleResults',   S.searchGoogleResults?.bind(S)],
   ].filter(([, fn]) => typeof fn === 'function');
 
   if (!requested || !Array.isArray(requested) || !requested.length) return maybe;
