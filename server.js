@@ -3,7 +3,7 @@ import cors from 'cors';
 import dotenv from 'dotenv';
 import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
-import { searchService } from './services/searchService.js';
+import { searchService } from './src/services/searchService.js';
 
 // Load env first
 dotenv.config();
