@@ -63,10 +63,73 @@ function uniqKey(r) {
   return `${t}::${p ?? 'na'}::${host}`;
 }
 
-/* ---------- PRECISION HELPERS (generic, category-agnostic) ---------- */
-
-// normalize text for match checks
+// shorthand normalizer
 function N(s = '') { return String(s).toLowerCase().replace(/\s+/g, ' ').trim(); }
+
+/* ---------- UK region filter ---------- */
+const UK_HOST_WHITELIST = new Set([
+  'ebay.co.uk',
+  'gumtree.com',             // UK site
+  'cashconverters.co.uk',
+  'vinted.co.uk',
+  'preloved.co.uk',
+  'onbuy.com',
+  'facebook.com',
+  'm.facebook.com',
+  'l.facebook.com',
+  'www.facebook.com',
+  'discogs.com',             // allow if GBP price
+  'google.com',              // allow if GBP price
+]);
+
+function hostnameOf(url) {
+  try { return new URL(url).hostname.replace(/^www\./, ''); } catch { return ''; }
+}
+function hasGBP(price) {
+  return /(^|[^A-Za-z])£\s*\d/.test(String(price || '')) || /\bGBP\b/i.test(String(price || ''));
+}
+function hasUSD(price) { return /\$\s*\d/.test(String(price || '')) || /\bUSD\b/i.test(String(price || '')); }
+function hasEUR(price) { return /€\s*\d/.test(String(price || ''))  || /\bEUR\b/i.test(String(price || '')); }
+function isUKHost(host) {
+  return host.endsWith('.co.uk') || host.endsWith('.uk') || UK_HOST_WHITELIST.has(host);
+}
+
+/**
+ * Keep UK-only results when requested:
+ *  - Prefer £/GBP prices
+ *  - Prefer UK hosts (.co.uk/.uk or whitelisted)
+ *  - Drop obvious $/€ unless host is clearly UK
+ */
+function regionFilter(list, { location = 'UK', ukOnly = false } = {}) {
+  const wantUK = ukOnly || String(location || '').toUpperCase() === 'UK';
+  if (!wantUK) return list;
+
+  const kept = [];
+  for (const r of list) {
+    const host = hostnameOf(r.link || '');
+    const gbp = hasGBP(r.price);
+    const usd = hasUSD(r.price);
+    const eur = hasEUR(r.price);
+    const ukHost = isUKHost(host);
+
+    // Hard allow if host looks UK and not clearly $/€
+    if (ukHost && !(usd || eur)) { kept.push(r); continue; }
+
+    // Allow FB only if price shows GBP
+    if (/facebook\.com$/.test(host) && gbp) { kept.push(r); continue; }
+
+    // Allow Discogs/Google only when GBP price visible
+    if ((host === 'discogs.com' || host === 'google.com') && gbp) { kept.push(r); continue; }
+
+    // Generic rule: require GBP if no UK host signal
+    if (gbp && !usd && !eur) { kept.push(r); continue; }
+
+    // otherwise drop
+  }
+  return kept;
+}
+
+/* ---------- PRECISION HELPERS (generic, category-agnostic) ---------- */
 
 // tokens we generally want to ignore as must-haves
 const COMMON_STOP = new Set([
@@ -158,10 +221,6 @@ function detectTargetModel(q) {
 
 /**
  * Generic precision filter with strict/relaxed modes + a couple of light domain heuristics.
- * @param {Array} results - listings [{title, description, ...}]
- * @param {string} query
- * @param {object|null} enhanced - enhancedQuery (optional)
- * @param {object} opts - { strict?: boolean, minHitsTitle?: number, minHitsRelaxed?: number }
  */
 function precisionFilter(results, query, enhanced = null, opts = {}) {
   const strict = opts.strict ?? true;
@@ -210,20 +269,22 @@ function precisionFilter(results, query, enhanced = null, opts = {}) {
 
     // Strymon heuristic: if user requested OB-1, drop other Strymon models unless OB-1 present
     if (brand === 'strymon' && targetModel) {
-      const hasTarget = /\bob[-.\s]?1\b/.test(`${title} ${desc}`);
+      const hay = `${title} ${desc}`;
+      const hasTarget = /\bob[-.\s]?1\b/.test(hay);
       const mentionsOther = STRYMON_MODELS
         .filter(m => !/\bob[ .-]?1\b/.test(m))
-        .some(m => `${title} ${desc}`.includes(m));
+        .some(m => hay.includes(m));
       if (!hasTarget && mentionsOther) continue;
     }
 
     // Pokémon SIR heuristic: if "SIR" in query, require SIR/Alt Art/SAR phrasing
     if (wantsSIR) {
-      const okSIR = /\bsir\b/.test(`${title} ${desc}`)
-        || /special illustration rare/.test(`${title} ${desc}`)
-        || /illustration rare/.test(`${title} ${desc}`)
-        || /\balt\s*art\b/.test(`${title} ${desc}`)
-        || /\bsar\b/.test(`${title} ${desc}`);
+      const hay = `${title} ${desc}`;
+      const okSIR = /\bsir\b/.test(hay)
+        || /special illustration rare/.test(hay)
+        || /illustration rare/.test(hay)
+        || /\balt\s*art\b/.test(hay)
+        || /\bsar\b/.test(hay);
       if (!okSIR) continue;
     }
 
@@ -253,6 +314,16 @@ function getActiveSources(requested) {
   return maybe.filter(([k]) => allow.has(k.toLowerCase()));
 }
 
+/* ---------- country code mapping for ScrapingBee ---------- */
+function toCountryCode(location = '') {
+  const s = N(location);
+  if (['uk','gb','united kingdom','great britain','england','scotland','wales','northern ireland'].includes(s)) return 'gb';
+  if (['us','usa','united states','america'].includes(s)) return 'us';
+  if (['ie','ireland','eire'].includes(s)) return 'ie';
+  // default to GB
+  return 'gb';
+}
+
 /* ---------- service ---------- */
 class SearchService {
   constructor() {
@@ -263,6 +334,13 @@ class SearchService {
   async performSearch(searchTerm, location = 'UK', currency = 'GBP', options = {}) {
     const startedAt = Date.now();
     const strictRequested = options.strictMode ?? STRICT_MODE_DEFAULT;
+
+    // Force ScrapingBee proxy region to match location (UK -> gb)
+    try {
+      scrapingService.countryCode = toCountryCode(location);
+    } catch (e) {
+      logger.warn(`⚠️ Failed to set scraping region: ${e?.message || e}`);
+    }
 
     // 1) Enhance query (keep expansions small)
     let enhanced;
@@ -319,17 +397,24 @@ class SearchService {
       unique.push({ ...r, priceAmount: parsePriceNumber(r.price) });
     }
 
-    // 5) Precision filtering with automatic fallback (strict → relaxed → none)
-    let filtered = precisionFilter(unique, searchTerm, enhanced, { strict: strictRequested });
+    // 5) Region filter (UK-only if requested by location or options.ukOnly)
+    const regioned = regionFilter(unique, { location, ukOnly: options.ukOnly === true });
+    if (!regioned.length) {
+      logger.info('ℹ️ Region filter removed all items; returning [].');
+      return [];
+    }
+
+    // 6) Precision filtering with automatic fallback (strict → relaxed → none)
+    let filtered = precisionFilter(regioned, searchTerm, enhanced, { strict: strictRequested });
     let mode = strictRequested ? 'strict' : 'relaxed';
 
     if (!filtered.length && strictRequested) {
-      const relaxed = precisionFilter(unique, searchTerm, enhanced, { strict: false });
+      const relaxed = precisionFilter(regioned, searchTerm, enhanced, { strict: false });
       if (relaxed.length) {
         filtered = relaxed;
         mode = 'relaxed';
       } else {
-        filtered = unique; // give *something* rather than nothing
+        filtered = regioned; // give *something* rather than nothing
         mode = 'none';
       }
     }
@@ -339,7 +424,7 @@ class SearchService {
       return [];
     }
 
-    // 6) Ranking
+    // 7) Ranking
     const med = median(filtered.map(x => x.priceAmount).filter(n => typeof n === 'number' && !Number.isNaN(n)));
     const qTerms = normalizeText(searchTerm).split(' ').filter(Boolean);
     const eTerms = (enhanced?.search_terms || []).map(normalizeText).filter(Boolean);
@@ -371,7 +456,7 @@ class SearchService {
 
     const top = scored.sort((a, b) => b.score - a.score).slice(0, MAX_RESULTS);
 
-    logger.info(`✅ Returning ${top.length} results in ${Date.now() - startedAt}ms (precision=${mode})`);
+    logger.info(`✅ Returning ${top.length} results in ${Date.now() - startedAt}ms (precision=${mode}, location=${location})`);
     return top;
   }
 
