@@ -1,87 +1,181 @@
-const pLimit = require('p-limit');
-const cfg = require('../config');
-const { expandQuery, embed } = require('./openaiService');
-const { rank, computeText } = require('./rankingService');
-const { dedupe } = require('../utils/dedupe');
+// src/services/searchService.js  (ESM)
+import pLimit from 'p-limit';
+import { openaiService } from './openaiService.js';
+import { scrapingService } from './scrapingService.js';
+import { logger } from '../utils/logger.js';
 
-const ebay = require('./scraping/ebay');
-const gumtree = require('./scraping/gumtree');
-const facebook = require('./scraping/facebook');
-const vinted = require('./scraping/vinted');
-const depop = require('./scraping/depop');
-const discogs = require('./scraping/discogs');
-const googleShopping = require('./scraping/googleShopping');
-const googleResults = require('./scraping/googleResults');
-
-const registry = {
-  ebay, gumtree,
-  facebook: cfg.sources.facebook && facebook,
-  vinted: cfg.sources.vinted && vinted,
-  depop: cfg.sources.depop && depop,
-  discogs: cfg.sources.discogs && discogs,
-  googleShopping: cfg.sources.googleShopping && googleShopping,
-  googleResults: cfg.sources.googleResults && googleResults,
+/* ---------- helpers ---------- */
+const SOURCE_WEIGHTS = {
+  ebay: 1.0,
+  gumtree: 0.9,
+  cashConverters: 0.85,
+  facebook: 0.75,
+  vinted: 0.75,
+  depop: 0.75,
+  discogs: 0.8,
+  googleShopping: 0.6,
+  googleResults: 0.6,
 };
 
-function getSources(requested) {
-  const all = Object.values(registry).filter(Boolean);
-  if (!requested || !requested.length) return all;
-  const map = Object.fromEntries(all.map(s => [s.source, s]));
-  return requested.map(s => map[s]).filter(Boolean);
+function normalizeText(s) { return (s || '').toLowerCase().replace(/\s+/g, ' ').trim(); }
+function parsePriceNumber(str) {
+  if (typeof str === 'number') return str;
+  if (!str) return null;
+  const m = String(str).replace(/,/g, '').match(/(-?\d+(?:\.\d{1,2})?)/);
+  return m ? parseFloat(m[1]) : null;
+}
+function median(nums) {
+  const a = nums.slice().sort((x, y) => x - y);
+  return a.length ? a[Math.floor(a.length / 2)] : null;
+}
+function priceClosenessScore(amount, med) {
+  if (!amount || !med) return 0.5;
+  const diffPct = Math.abs(amount - med) / (med + 1e-6);
+  return Math.max(0, 1 - Math.min(1, diffPct));
+}
+function recencyScore(iso) {
+  if (!iso) return 0.5;
+  const ts = Date.parse(iso); if (Number.isNaN(ts)) return 0.5;
+  const days = (Date.now() - ts) / 86400000;
+  if (days <= 1) return 1.0;
+  if (days <= 7) return 0.8;
+  if (days <= 30) return 0.6;
+  if (days <= 90) return 0.4;
+  return 0.2;
+}
+function uniqKey(r) {
+  const t = normalizeText(r?.title);
+  const p = parsePriceNumber(r?.price);
+  const link = r?.link || '';
+  let host = '';
+  try { host = new URL(link).hostname.replace(/^www\./, ''); } catch {}
+  return `${t}::${p ?? 'na'}::${host}`;
 }
 
-async function search(params) {
-  const { search_term, sources, maxPages = 1 } = params;
-  const expansion = await expandQuery(search_term);
-  const generatedQueries = expansion.expansions?.length ? expansion.expansions : [search_term];
+/* ---------- active sources from scrapingService ---------- */
+function getActiveSources(requested) {
+  const maybe = [
+    ['ebay', scrapingService.searchEbay],
+    ['gumtree', scrapingService.searchGumtree],
+    ['cashConverters', scrapingService.searchCashConverters],
+    ['facebook', scrapingService.searchFacebookMarketplace],
+    ['vinted', scrapingService.searchVinted],
+    ['depop', scrapingService.searchDepop],
+    ['discogs', scrapingService.searchDiscogs],
+    ['googleShopping', scrapingService.searchGoogleShopping],
+    ['googleResults', scrapingService.searchGoogleResults],
+  ].filter(([, fn]) => typeof fn === 'function');
 
-  // Embed canonical text once
-  const canonicalText = [expansion?.canonical?.brand, expansion?.canonical?.model, expansion?.canonical?.variant].filter(Boolean).join(' ');
-  const qEmbedding = await embed(canonicalText || search_term);
+  if (!requested || !Array.isArray(requested) || !requested.length) return maybe;
+  const allow = new Set(requested.map(s => s.toLowerCase()));
+  return maybe.filter(([k]) => allow.has(k.toLowerCase()));
+}
 
-  const limit = pLimit(cfg.maxConcurrency);
-  const scrapers = getSources(sources);
+/* ---------- service ---------- */
+class SearchService {
+  constructor() {
+    this.lastEnhancedQuery = null;
+    this.maxConcurrency = Number(process.env.MAX_CONCURRENCY || 4);
+  }
 
-  const results = [];
-  await Promise.all(scrapers.map(scraper => limit(async () => {
-    for (const q of generatedQueries) {
-      try {
-        const items = await scraper.search({ query: q, maxPages });
-        for (const it of items) {
-          results.push({ ...it });
-        }
-      } catch (e) {
-        // swallow per-source errors; could log
-        // console.error(`[${scraper.source}]`, e.message);
+  async performSearch(searchTerm, location = 'UK', currency = 'GBP', options = {}) {
+    const startedAt = Date.now();
+
+    // 1) Enhance query (fallback safely)
+    let enhanced;
+    try {
+      enhanced = await openaiService.enhanceSearchQuery(searchTerm);
+    } catch (e) {
+      logger.warn(`⚠️ OpenAI enhance failed: ${e?.message || e}`);
+      enhanced = openaiService.getFallbackEnhancement(searchTerm);
+    }
+    this.lastEnhancedQuery = enhanced;
+
+    const expansions = Array.isArray(enhanced?.search_terms) ? enhanced.search_terms : [];
+    const terms = [String(searchTerm || '').trim(), ...expansions]
+      .filter(Boolean)
+      .slice(0, 5);
+
+    // 2) Pick sources & concurrency
+    const sources = getActiveSources(options.sources);
+    const limit = pLimit(this.maxConcurrency);
+
+    // 3) Fire scrapes (per term x source), but never crash on a single failure
+    const jobs = [];
+    for (const t of terms) {
+      for (const [key, fn] of sources) {
+        jobs.push(
+          limit(async () => {
+            try {
+              const out = await fn(t, location, options.maxPages || 1);
+              return Array.isArray(out) ? out.map(x => (x?.source ? x : { ...x, source: key })) : [];
+            } catch (e) {
+              logger.warn(`[${key}] failed for "${t}": ${e?.message || e}`);
+              return [];
+            }
+          })
+        );
       }
     }
-  })));
+    const settled = await Promise.all(jobs);
+    const all = settled.flat().filter(Boolean);
 
-  // Deduplicate first
-  let deduped = dedupe(results);
+    if (!all.length) {
+      logger.warn('⚠️ No results from any source');
+      return [];
+    }
 
-  // Attach embeddings (cheap path: reuse query embedding)
-  deduped = deduped.map(it => ({ ...it, embedding: qEmbedding }));
+    // 4) Deduplicate + compute numeric price
+    const seen = new Set();
+    const unique = [];
+    for (const r of all) {
+      if (!r?.title || !r?.link) continue;
+      const key = uniqKey(r);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      unique.push({ ...r, priceAmount: parsePriceNumber(r.price) });
+    }
 
-  // Median price per set (rough)
-  const prices = deduped.map(x => x.price?.amount).filter(x => typeof x === 'number').sort((a,b) => a-b);
-  const median = prices.length ? prices[Math.floor(prices.length/2)] : null;
+    // 5) Ranking
+    const med = median(unique.map(x => x.priceAmount).filter(n => typeof n === 'number' && !Number.isNaN(n)));
+    const qTerms = normalizeText(searchTerm).split(' ').filter(Boolean);
+    const eTerms = (enhanced?.search_terms || []).map(normalizeText).filter(Boolean);
+    const cats = (enhanced?.categories || []).map(normalizeText).filter(Boolean);
 
-  const ranked = rank(deduped, {
-    queryEmbedding: qEmbedding,
-    medianPrice: median,
-    keywords: (expansion.aliases || []).concat(expansion.canonical?.model || [])
-  });
+    const scored = unique.map((r) => {
+      const title = normalizeText(r.title);
+      const desc = normalizeText(r.description || '');
+      const src = r.source || '';
 
-  return {
-    query: search_term,
-    expansion,
-    counts: {
-      total: results.length,
-      deduped: deduped.length
-    },
-    items: ranked
-  };
+      // term matches
+      let m = 0;
+      for (const t of qTerms) { if (t && title.includes(t)) m += 0.30; if (t && desc.includes(t)) m += 0.10; }
+      for (const t of eTerms) { if (t && title.includes(t)) m += 0.20; if (t && desc.includes(t)) m += 0.05; }
+      for (const c of cats)   { if (c && (title.includes(c) || desc.includes(c))) m += 0.15; }
+      if (title.includes(normalizeText(searchTerm))) m += 0.25;
+
+      // small tweaks
+      if ((r.title || '').length < 20) m -= 0.05;
+      if (r.image) m += 0.03;
+
+      const priceScore = priceClosenessScore(r.priceAmount, med) * 0.15;
+      const recScore   = recencyScore(r.postedAt) * 0.10;
+      const srcWeight  = (SOURCE_WEIGHTS[src] ?? 0.6) * 0.05;
+
+      let score = 0.50 * Math.min(1, Math.max(0, m)) + priceScore + recScore + srcWeight;
+      score = Math.max(0, Math.min(1, score));
+      return { ...r, score: Math.round(score * 100) / 100 };
+    });
+
+    const top = scored.sort((a, b) => b.score - a.score).slice(0, 40);
+
+    // 6) (Optional) currency conversion – keep your simple approach here if needed
+    // For now, just return as-is in GBP-style strings.
+    logger.info(`✅ Returning ${top.length} results in ${Date.now() - startedAt}ms`);
+    return top;
+  }
+
+  getLastEnhancedQuery() { return this.lastEnhancedQuery; }
 }
 
-module.exports = { search };
+export const searchService = new SearchService();
