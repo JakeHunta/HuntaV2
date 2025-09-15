@@ -54,7 +54,7 @@ function recencyScore(iso) {
   return 0.2;
 }
 
-// NOTE: accept BOTH link and url; build key from whichever exists
+// Accept BOTH link and url; build key from whichever exists
 function uniqKey(r) {
   const t = normalizeText(r?.title);
   const p = parsePriceNumber(r?.price);
@@ -70,7 +70,7 @@ function N(s = '') { return String(s).toLowerCase().replace(/\s+/g, ' ').trim();
 /* ---------- UK region filter ---------- */
 const UK_HOST_WHITELIST = new Set([
   'ebay.co.uk',
-  'gumtree.com',             // UK site
+  'gumtree.com',
   'cashconverters.co.uk',
   'vinted.co.uk',
   'preloved.co.uk',
@@ -79,16 +79,14 @@ const UK_HOST_WHITELIST = new Set([
   'm.facebook.com',
   'l.facebook.com',
   'www.facebook.com',
-  'discogs.com',             // allow if GBP price
-  'google.com',              // allow if GBP price
+  'discogs.com',
+  'google.com',
 ]);
 
 function hostnameOf(url) {
   try { return new URL(url).hostname.replace(/^www\./, ''); } catch { return ''; }
 }
-function hasGBP(price) {
-  return /(^|[^A-Za-z])£\s*\d/.test(String(price || '')) || /\bGBP\b/i.test(String(price || ''));
-}
+function hasGBP(price) { return /(^|[^A-Za-z])£\s*\d/.test(String(price || '')) || /\bGBP\b/i.test(String(price || '')); }
 function hasUSD(price) { return /\$\s*\d/.test(String(price || '')) || /\bUSD\b/i.test(String(price || '')); }
 function hasEUR(price) { return /€\s*\d/.test(String(price || ''))  || /\bEUR\b/i.test(String(price || '')); }
 function isUKHost(host) {
@@ -96,11 +94,11 @@ function isUKHost(host) {
 }
 
 /**
- * Keep UK-only results when requested:
- *  - Prefer £/GBP prices
- *  - Prefer UK hosts (.co.uk/.uk or whitelisted)
- *  - Facebook: allow regardless of price (ScrapingBee uses country_code=gb)
- * FAIL-OPEN: caller will fall back to unfiltered if this returns []
+ * Keep UK-only results when requested.
+ * - Prefer £/GBP prices
+ * - Prefer UK hosts (.co.uk/.uk or whitelisted)
+ * - Facebook now requires GBP (or no visible price) to avoid USD bleed
+ * FAIL-OPEN: caller will return [] if nothing survives
  */
 function regionFilter(list, { location = 'UK', ukOnly = false } = {}) {
   const wantUK = ukOnly || String(location || '').toUpperCase() === 'UK';
@@ -115,8 +113,11 @@ function regionFilter(list, { location = 'UK', ukOnly = false } = {}) {
     const eur = hasEUR(r.price);
     const ukHost = isUKHost(host);
 
-    // Facebook: already geo-scoped by ScrapingBee (gb)
-    if (host.endsWith('facebook.com')) { kept.push(r); continue; }
+    // Facebook: require GBP (or no explicit currency)
+    if (host.endsWith('facebook.com')) {
+      if (gbp || (!usd && !eur && !r.price)) { kept.push(r); }
+      continue;
+    }
 
     // Hard allow if host looks UK and not clearly $/€
     if (ukHost && !(usd || eur)) { kept.push(r); continue; }
@@ -126,14 +127,11 @@ function regionFilter(list, { location = 'UK', ukOnly = false } = {}) {
 
     // Generic rule: require GBP if no UK host signal
     if (gbp && !usd && !eur) { kept.push(r); continue; }
-
-    // otherwise drop
   }
   return kept;
 }
 
-/* ---------- PRECISION HELPERS (generic, category-agnostic) ---------- */
-
+/* ---------- PRECISION HELPERS ---------- */
 const COMMON_STOP = new Set([
   'the','a','an','and','or','with','for','of','to','in','on',
   'card','tcg','pokemon','pokémon','guitar','effects','pedal','amp','amps'
@@ -351,7 +349,7 @@ class SearchService {
           limit(async () => {
             try {
               const out = await fn(t, location, options.maxPages || 1);
-              // CRITICAL NORMALIZATION: make sure both link and url exist
+              // Make sure both link and url exist
               return Array.isArray(out)
                 ? out
                     .filter(Boolean)
@@ -361,8 +359,8 @@ class SearchService {
                       return {
                         ...x,
                         source: x?.source || key,
-                        link,  // ensure set for dedupe/region
-                        url,   // keep original too (frontend may expect url)
+                        link,
+                        url,
                       };
                     })
                 : [];
@@ -375,7 +373,7 @@ class SearchService {
       }
     }
 
-    // ✅ Use allSettled so one slow/failed source can't block the whole search
+    // Use allSettled so one slow/failed source can't block the whole search
     const settled = await Promise.allSettled(jobs);
     let all = [];
     for (const s of settled) {
@@ -392,15 +390,15 @@ class SearchService {
     const unique = [];
     for (const r of all) {
       if (!r?.title) continue;
-      const href = r?.link || r?.url; // must have at least one
-      if (!href) continue;            // drop truly broken entries
+      const href = r?.link || r?.url;
+      if (!href) continue;
       const key = uniqKey(r);
       if (seen.has(key)) continue;
       seen.add(key);
       unique.push({ ...r, priceAmount: parsePriceNumber(r.price) });
     }
 
-    // 5) Region filter (FAIL-OPEN)
+    // 5) Region filter
     const regioned = regionFilter(unique, { location, ukOnly: options.ukOnly === true });
     if (!regioned.length) {
       logger.info('ℹ️ Region filter removed all items; returning [].');
@@ -417,7 +415,7 @@ class SearchService {
         filtered = relaxed;
         mode = 'relaxed';
       } else {
-        filtered = regioned; // give something rather than nothing
+        filtered = regioned;
         mode = 'none';
       }
     }
@@ -444,7 +442,7 @@ class SearchService {
       for (const t of qTerms) { if (t && title.includes(t)) m += 0.30; if (t && desc.includes(t)) m += 0.10; }
       for (const t of eTerms) { if (t && title.includes(t)) m += 0.15; if (t && desc.includes(t)) m += 0.05; }
       for (const c of cats)   { if (c && (title.includes(c) || desc.includes(c))) m += 0.10; }
-      if (title.includes(exactQ)) m += 0.20;       // exact phrase boost
+      if (title.includes(exactQ)) m += 0.20;
       if ((r.title || '').length < 20) m -= 0.05;
       if (r.image) m += 0.03;
 
