@@ -1,27 +1,52 @@
-const axios = require('axios');
-const pRetry = require('p-retry');
-const cfg = require('../config');
+// Robust ScrapingBee wrapper
+// Ensures target URL is always passed, adds helpful upstream debug,
+// and sets sane defaults that work well for eBay/FB/Gumtree.
 
-const client = axios.create({
-  baseURL: 'https://app.scrapingbee.com/api/v1/',
-  timeout: cfg.requestTimeoutMs
-});
+import axios from "axios";
 
-async function fetch(url, options = {}) {
+const BEE_BASE = "https://app.scrapingbee.com/api/v1/";
+
+export async function scrapingBee({
+  url,
+  render_js = false,
+  wait,
+  premium_proxy = true,
+  block_resources = true,
+  country_code = "gb",
+  headers = {},
+  json_response = false,
+  timeout = 20000,
+}) {
+  if (!url) throw new Error("ScrapingBee missing target url");
+
   const params = {
-    api_key: cfg.scrapingBee.apiKey,
+    api_key: process.env.SCRAPINGBEE_API_KEY,
     url,
-    country_code: cfg.scrapingBee.country,
-    render_js: true,
-    block_resources: true,
-    premium_proxy: cfg.scrapingBee.premium,
-    ...options.params,
+    render_js: render_js ? "true" : "false",
+    premium_proxy: premium_proxy ? "true" : "false",
+    block_resources: block_resources ? "true" : "false",
+    country_code,
   };
+  if (wait) params.wait = String(wait);
+  if (json_response) params.json_response = "true";
 
-  return pRetry(async () => {
-    const res = await client.get('/', { params });
-    return { data: res.data, status: res.status, headers: res.headers };
-  }, { retries: 2, minTimeout: 400, maxTimeout: 1500 });
+  try {
+    const res = await axios.get(BEE_BASE, {
+      params,
+      headers,
+      timeout,
+    });
+    return res.data;
+  } catch (err) {
+    const beeStatus = err?.response?.status;
+    const data = err?.response?.data;
+    if (json_response && data) {
+      console.warn("ScrapingBee upstream:", {
+        beeStatus,
+        original_status: data.original_status,
+        original_status_text: data.original_status_text,
+      });
+    }
+    throw err;
+  }
 }
-
-module.exports = { fetch };
