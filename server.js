@@ -23,9 +23,30 @@ app.set('trust proxy', 1);
 // Middleware
 app.use(helmet());
 
-// CORS
-const allowedOrigin = process.env.FRONTEND_ORIGIN || '*';
-app.use(cors({ origin: allowedOrigin }));
+// CORS - Updated to allow your frontend domain
+app.use(cors({
+  origin: [
+    'http://localhost:5173',
+    'http://localhost:3000',
+    'https://hunta.uk',
+    'https://*.netlify.app',
+    'https://*.netlify.com',
+    process.env.FRONTEND_ORIGIN
+  ].filter(Boolean), // Remove any undefined values
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept'],
+  optionsSuccessStatus: 200 // For legacy browser support
+}));
+
+// Explicit OPTIONS handler for preflight requests
+app.options('*', (req, res) => {
+  res.header('Access-Control-Allow-Origin', req.headers.origin || '*');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept');
+  res.header('Access-Control-Allow-Credentials', 'true');
+  res.sendStatus(200);
+});
 
 // JSON
 app.use(express.json({ limit: '1mb' }));
@@ -58,6 +79,11 @@ const logWithTimestamp = (level, message, data = {}) => {
 
 // Routes
 app.get('/', (req, res) => {
+  // Add CORS headers explicitly
+  res.header('Access-Control-Allow-Origin', req.headers.origin || '*');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With');
+  
   res.json({
     name: 'Hunta Backend API',
     version: '2.0.0',
@@ -73,6 +99,11 @@ app.get('/', (req, res) => {
 });
 
 app.get('/health', (req, res) => {
+  // Add CORS headers explicitly
+  res.header('Access-Control-Allow-Origin', req.headers.origin || '*');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With');
+  
   res.json({
     status: 'healthy',
     timestamp: new Date().toISOString(),
@@ -85,6 +116,11 @@ app.get('/health', (req, res) => {
 });
 
 app.get('/user-stats', (req, res) => {
+  // Add CORS headers explicitly
+  res.header('Access-Control-Allow-Origin', req.headers.origin || '*');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With');
+  
   res.json({
     uptimeSeconds: Math.floor(process.uptime()),
     totalSearches: userStats.totalSearches,
@@ -98,6 +134,12 @@ app.post('/', (req, res) => {
 
 // Search endpoint
 app.post('/search', async (req, res) => {
+  // Add CORS headers explicitly at the start
+  res.header('Access-Control-Allow-Origin', req.headers.origin || '*');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With');
+  res.header('Access-Control-Allow-Credentials', 'true');
+  
   const startTime = Date.now();
   try {
     const { search_term, location = 'UK', currency = 'GBP', sources, maxPages } = req.body || {};
@@ -120,7 +162,8 @@ app.post('/search', async (req, res) => {
       location: searchLocation,
       currency: searchCurrency,
       sources,
-      maxPages
+      maxPages,
+      origin: req.headers.origin
     });
 
     if (req.get('content-length') && Number(req.get('content-length')) > 0) {
@@ -229,7 +272,7 @@ app.listen(PORT, () => {
   logWithTimestamp('info', `🎯 Hunta Backend API started successfully on port ${PORT}`);
   console.log(`🔍 POST /search`);
   console.log(`🏥 GET  /health`);
+  console.log(`🌐 CORS enabled for: https://hunta.uk, localhost, and Netlify domains`);
 });
 
 export default app;
-
