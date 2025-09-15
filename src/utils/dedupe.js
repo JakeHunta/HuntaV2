@@ -1,26 +1,17 @@
-const crypto = require('crypto');
-
-function hashUrl(url) { return crypto.createHash('sha1').update(url || '').digest('hex'); }
-
-function keyFromTitle(t) {
-  return (t || '')
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, ' ')
-    .replace(/\b(the|a|an|for|and|or|with|of|in|on)\b/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
-}
-
-function dedupe(items) {
+// Dedupe using URL origin + pathname (stable for FB item IDs, etc.)
+export function dedupeByUrlPath(items) {
   const seen = new Set();
   const out = [];
   for (const it of items) {
-    const k = `${hashUrl(it.link)}:${keyFromTitle(it.title)}`;
-    if (seen.has(k)) continue;
-    seen.add(k);
-    out.push(it);
+    try {
+      const u = new URL(it.url);
+      const key = `${u.origin}${u.pathname}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(it);
+    } catch {
+      out.push(it); // if URL parsing fails, keep rather than over-drop
+    }
   }
   return out;
 }
-
-module.exports = { dedupe, keyFromTitle, hashUrl };
