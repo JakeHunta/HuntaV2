@@ -1,3 +1,4 @@
+// backend/server.js
 import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
@@ -5,269 +6,147 @@ import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
 import { searchService } from './src/services/searchService.js';
 
-// Load env first
 dotenv.config();
 
-// Quick env check
-console.log('🔧 Environment check:');
-console.log('- OPENAI_API_KEY:', process.env.OPENAI_API_KEY ? `✅ Loaded (${process.env.OPENAI_API_KEY.slice(0, 8)}...)` : '❌ Missing');
-console.log('- SCRAPINGBEE_API_KEY:', process.env.SCRAPINGBEE_API_KEY ? `✅ Loaded (${process.env.SCRAPINGBEE_API_KEY.slice(0, 8)}...)` : '❌ Missing');
-console.log('- NODE_ENV:', process.env.NODE_ENV || 'development');
-
 const app = express();
-const PORT = process.env.PORT || 3001;
-
-// Trust Render proxy (for rate limit / IPs)
+const PORT = process.env.PORT || 10000;
 app.set('trust proxy', 1);
 
-// MOST AGGRESSIVE CORS FIX - Apply to ALL responses
-app.use((req, res, next) => {
-  const origin = req.headers.origin;
-  
-  // Allow all origins for now to fix the issue
-  res.header('Access-Control-Allow-Origin', origin || '*');
-  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS, HEAD');
-  res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization, Cache-Control, Pragma');
-  res.header('Access-Control-Allow-Credentials', 'true');
-  res.header('Access-Control-Max-Age', '86400'); // 24 hours
-  
-  // Handle preflight requests
-  if (req.method === 'OPTIONS') {
-    console.log(`🔧 CORS preflight for ${req.path} from origin: ${origin}`);
-    return res.status(200).end();
-  }
-  
-  console.log(`🌐 CORS headers set for ${req.method} ${req.path} from origin: ${origin}`);
-  next();
-});
-
-// Middleware
-app.use(helmet({
-  crossOriginResourcePolicy: { policy: "cross-origin" }
-}));
-
-// Additional CORS with express cors middleware
-app.use(cors({
-  origin: function (origin, callback) {
-    // Allow all origins for now
-    callback(null, true);
+/* ---------- CORS FIRST ---------- */
+const ALLOWED = [
+  'https://hunta.uk',
+  /^https:\/\/[a-z0-9-]+\.netlify\.app$/i, // Netlify previews/branches
+  /^http:\/\/localhost:(5173|3000)$/i,
+];
+const corsOptions = {
+  origin(origin, cb) {
+    if (!origin) return cb(null, true); // curl/postman/no-origin
+    const ok = ALLOWED.some((rule) =>
+      typeof rule === 'string' ? rule === origin : rule.test(origin)
+    );
+    return cb(ok ? null : new Error(`CORS blocked for ${origin}`), ok);
   },
-  credentials: true,
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'HEAD'],
-  allowedHeaders: ['Origin', 'X-Requested-With', 'Content-Type', 'Accept', 'Authorization', 'Cache-Control', 'Pragma'],
-  optionsSuccessStatus: 200
-}));
+  methods: ['GET', 'POST', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept'],
+  credentials: false,      // keep false since we allow multiple origins
+  optionsSuccessStatus: 204,
+};
+app.use(cors(corsOptions));
+app.options('*', cors(corsOptions)); // preflight
 
-// JSON
-app.use(express.json({ limit: '1mb' }));
-
-// Extend response timeout to reduce AbortError from frontend (UI can still abort earlier)
-app.use((req, res, next) => {
-  res.setTimeout(65000); // 65s
-  next();
-});
-
-// Basic global rate limit
+/* ---------- Helmet (API-safe) ---------- */
+app.disable('x-powered-by');
 app.use(
-  rateLimit({
-    windowMs: 60 * 1000,
-    max: 60, // 60 req/min
-    standardHeaders: true,
-    legacyHeaders: false
+  helmet({
+    crossOriginOpenerPolicy: false,
+    crossOriginResourcePolicy: false,
+    contentSecurityPolicy: false, // API returns JSON only
   })
 );
 
-// In-memory user stats
-const userStats = { totalSearches: 0 };
+/* ---------- Standard middleware ---------- */
+app.use(express.json({ limit: '1mb' }));
+app.use(
+  rateLimit({
+    windowMs: 60 * 1000,
+    max: 60,
+    standardHeaders: true,
+    legacyHeaders: false,
+  })
+);
 
-// Utility logger
-const logWithTimestamp = (level, message, data = {}) => {
-  const timestamp = new Date().toISOString();
-  console.log(`[${timestamp}] ${level.toUpperCase()}: ${message}`);
-  if (data && Object.keys(data).length) console.log('Data:', JSON.stringify(data, null, 2));
+/* ---------- tiny logger ---------- */
+const log = (level, msg, data) => {
+  const ts = new Date().toISOString();
+  console.log(`[${ts}] ${level.toUpperCase()}: ${msg}`);
+  if (data) console.log('Data:', JSON.stringify(data, null, 2));
 };
 
-// Routes
-app.get('/', (req, res) => {
+/* ---------- health ---------- */
+app.get('/health', (_req, res) => {
   res.json({
-    name: 'Hunta Backend API',
-    version: '2.1.0',
-    status: 'running',
-    cors: 'enabled-aggressive',
-    endpoints: {
-      'POST /search': 'Search for second-hand items',
-      'GET /health': 'Health check',
-      'GET /user-stats': 'User and usage statistics',
-      'GET /': 'API information'
-    },
-    timestamp: new Date().toISOString()
-  });
-});
-
-app.get('/health', (req, res) => {
-  res.json({
-    status: 'healthy',
-    timestamp: new Date().toISOString(),
+    status: 'ok',
     services: {
-      openai: process.env.OPENAI_API_KEY ? 'configured' : 'missing',
-      scrapingbee: process.env.SCRAPINGBEE_API_KEY ? 'configured' : 'missing'
+      openai: !!process.env.OPENAI_API_KEY,
+      scrapingbee: !!process.env.SCRAPINGBEE_API_KEY,
     },
-    uptime: Math.floor(process.uptime())
+    ts: new Date().toISOString(),
   });
 });
 
-app.get('/user-stats', (req, res) => {
+/* ---------- user stats (optional) ---------- */
+const userStats = { totalSearches: 0 };
+app.get('/user-stats', (_req, res) => {
   res.json({
     uptimeSeconds: Math.floor(process.uptime()),
     totalSearches: userStats.totalSearches,
-    timestamp: new Date().toISOString()
+    ts: new Date().toISOString(),
   });
 });
 
-app.post('/', (req, res) => {
-  res.status(400).json({ error: 'Use POST /search instead of POST /' });
-});
-
-// Search endpoint
+/* ---------- search ---------- */
 app.post('/search', async (req, res) => {
-  const startTime = Date.now();
-  
-  console.log(`🔍 Search request from origin: ${req.headers.origin}`);
-  
+  const start = Date.now();
   try {
-    const { search_term, location = 'UK', currency = 'GBP', sources, maxPages } = req.body || {};
-
+    const { search_term, location = 'UK', currency = 'GBP', sources, maxPages, ukOnly } = req.body || {};
     if (!search_term || typeof search_term !== 'string' || !search_term.trim()) {
-      logWithTimestamp('warn', 'Invalid search term provided', { search_term });
-      return res.status(400).json({
-        error: 'Invalid search term',
-        message: 'Please provide a non-empty search term as a string',
-        timestamp: new Date().toISOString()
-      });
+      return res.status(400).json({ error: 'Invalid search term' });
     }
 
-    const cleanSearchTerm = search_term.trim();
-    const searchLocation = (location || 'UK').trim();
-    const searchCurrency = currency || 'GBP';
-
-    logWithTimestamp('info', 'Starting search', {
-      searchTerm: cleanSearchTerm,
-      location: searchLocation,
-      currency: searchCurrency,
-      sources,
-      maxPages,
-      origin: req.headers.origin
+    const clean = search_term.trim();
+    log('info', 'Starting search', {
+      origin: req.headers.origin,
+      search_term: clean,
+      location, currency, sources, maxPages, ukOnly,
     });
-
-    if (req.get('content-length') && Number(req.get('content-length')) > 0) {
-      logWithTimestamp('debug', 'Request body present', req.body);
-    }
 
     userStats.totalSearches++;
-
-    const items = await searchService.performSearch(
-      cleanSearchTerm,
-      searchLocation,
-      searchCurrency,
-      { sources, maxPages }
-    );
-
+    const items = await searchService.performSearch(clean, location, currency, { sources, maxPages, ukOnly });
     const enhancedQuery = searchService.getLastEnhancedQuery();
-    const processingTime = Date.now() - startTime;
 
-    logWithTimestamp('info', 'Search completed', {
-      resultsCount: items.length,
-      processingTimeMs: processingTime
+    log('info', 'Search completed', {
+      resultsCount: items?.length || 0,
+      processingTimeMs: Date.now() - start,
     });
 
-    console.log(`✅ Sending response with ${items.length} items and CORS headers`);
-
-    res.json({
-      items,
-      listings: items,
-      enhancedQuery
+    // IMPORTANT: return normalized fields including image/priceLabel/currency
+    return res.json({ listings: items, items, enhancedQuery });
+  } catch (err) {
+    log('error', 'Search failed', {
+      message: err?.message,
+      stack: err?.stack,
+      code: err?.code,
+      tookMs: Date.now() - start,
     });
-  } catch (error) {
-    const processingTime = Date.now() - startTime;
-
-    console.error('💥 Full search error details:', {
-      message: error?.message,
-      stack: error?.stack,
-      name: error?.name,
-      code: error?.code,
-      processingTimeMs: processingTime,
-      searchTerm: req.body?.search_term
-    });
-
-    logWithTimestamp('error', 'Search request failed', {
-      message: error?.message,
-      stack: error?.stack,
-      processingTimeMs: processingTime,
-      name: error?.name,
-      code: error?.code
-    });
-
-    res.status(500).json({
+    return res.status(500).json({
       error: 'Search failed',
-      message: error?.message || 'Internal error',
-      code: error?.code,
-      name: error?.name,
-      timestamp: new Date().toISOString(),
-      processingTimeMs: processingTime
+      message: err?.message || 'Internal error',
     });
   }
 });
 
-// 404 handler
+/* ---------- 404 ---------- */
 app.use((req, res) => {
-  logWithTimestamp('warn', '404 - Endpoint not found', {
+  log('warn', 'Not found', { method: req.method, path: req.path });
+  res.status(404).json({ error: 'Endpoint not found' });
+});
+
+/* ---------- errors ---------- */
+app.use((err, req, res, _next) => {
+  log('error', 'Unhandled', {
+    message: err?.message,
+    stack: err?.stack,
     method: req.method,
     path: req.path,
-    ip: req.ip
   });
-  res.status(404).json({
-    error: 'Endpoint not found',
-    message: `${req.method} ${req.path} is not a valid endpoint`,
-    availableEndpoints: {
-      'POST /search': 'Search for second-hand items',
-      'GET /health': 'Health check',
-      'GET /user-stats': 'User and usage statistics',
-      'GET /': 'API information'
-    },
-    timestamp: new Date().toISOString()
-  });
+  res.status(500).json({ error: 'Internal server error' });
 });
 
-// Global error handler
-app.use((error, req, res, next) => {
-  logWithTimestamp('error', 'Unhandled server error', {
-    message: error?.message,
-    stack: error?.stack,
-    name: error?.name,
-    code: error?.code,
-    method: req.method,
-    path: req.path
-  });
-  res.status(500).json({
-    error: 'Internal server error',
-    message: 'An unexpected error occurred',
-    timestamp: new Date().toISOString()
-  });
-});
-
-// Hardening for unhandled errors
-process.on('unhandledRejection', (reason) => {
-  console.error('UNHANDLED_REJECTION', reason);
-});
-process.on('uncaughtException', (err) => {
-  console.error('UNCAUGHT_EXCEPTION', err);
-});
+process.on('unhandledRejection', (r) => console.error('UNHANDLED_REJECTION', r));
+process.on('uncaughtException', (e) => console.error('UNCAUGHT_EXCEPTION', e));
 
 app.listen(PORT, () => {
-  logWithTimestamp('info', `🎯 Hunta Backend API started successfully on port ${PORT}`);
-  console.log(`🔍 POST /search`);
-  console.log(`🏥 GET  /health`);
-  console.log(`🌐 AGGRESSIVE CORS enabled - allowing ALL origins`);
+  console.log(`🎯 Hunta Backend API on ${PORT}`);
+  console.log('🔍 POST /search');
+  console.log('🏥 GET  /health');
 });
-
-export default app;
