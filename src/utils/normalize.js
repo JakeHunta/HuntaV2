@@ -1,3 +1,4 @@
+// Keep items that have URL + title + (price OR image)
 export function normalizeListing(listing) {
   if (!listing) return null;
   const title = (listing.title || "").trim();
@@ -12,7 +13,6 @@ export function normalizeListing(listing) {
     title,
     currency: listing.currency || "GBP",
     location: listing.location || "UK",
-    // accept items with price OR image (FB/CC often omit one)
-    __ok: !!(url && title && (price || image)),
+    __ok: !!(url && title && (price || image))
   };
 }
