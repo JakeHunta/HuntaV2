@@ -13,9 +13,9 @@ class ScrapingService {
     return process.env.SCRAPINGBEE_API_KEY;
   }
 
-  /* ---------------------------
-   * ScrapingBee fetch helpers
-   * --------------------------- */
+  /**
+   * Fetch HTML through ScrapingBee and return Cheerio $
+   */
   async fetchHTML(
     url,
     {
@@ -23,11 +23,13 @@ class ScrapingService {
       wait = 0,
       premium_proxy = true,
       block_resources = true,
-      headers = {},
-      timeout = 20000,        // ↓ default down from 60000 to keep end-to-end fast
+      headers = undefined,
+      timeout = 60000,
     } = {}
   ) {
-    if (!this.scrapingBeeApiKey) throw new Error('SCRAPINGBEE_API_KEY missing');
+    if (!this.scrapingBeeApiKey) {
+      throw new Error('SCRAPINGBEE_API_KEY missing');
+    }
 
     const params = {
       api_key: this.scrapingBeeApiKey,
@@ -38,17 +40,35 @@ class ScrapingService {
       country_code: this.countryCode,
     };
     if (wait) params.wait = String(wait);
+    if (headers) params.forward_headers = 'true'; // let SB forward UA/accepts
 
     logger.info('🐝 ScrapingBee GET', { url, params: { ...params, api_key: '***' } });
-    const res = await axios.get(this.scrapingBeeBaseUrl, { params, timeout, headers });
+
+    const res = await axios.get(this.scrapingBeeBaseUrl, {
+      params,
+      timeout,
+      headers,
+    });
     return cheerio.load(res.data);
   }
 
+  /**
+   * Fetch raw text (e.g., RSS/XML) through ScrapingBee
+   */
   async fetchText(
     url,
-    { render_js = false, wait = 0, premium_proxy = true, block_resources = true, headers = {}, timeout = 20000 } = {}
+    {
+      render_js = false,
+      wait = 0,
+      premium_proxy = true,
+      block_resources = true,
+      headers = undefined,
+      timeout = 20000,
+    } = {}
   ) {
-    if (!this.scrapingBeeApiKey) throw new Error('SCRAPINGBEE_API_KEY missing');
+    if (!this.scrapingBeeApiKey) {
+      throw new Error('SCRAPINGBEE_API_KEY missing');
+    }
 
     const params = {
       api_key: this.scrapingBeeApiKey,
@@ -59,15 +79,23 @@ class ScrapingService {
       country_code: this.countryCode,
     };
     if (wait) params.wait = String(wait);
+    if (headers) params.forward_headers = 'true';
 
     logger.info('🐝 ScrapingBee GET (text)', { url, params: { ...params, api_key: '***' } });
-    const res = await axios.get(this.scrapingBeeBaseUrl, { params, timeout, headers });
+
+    const res = await axios.get(this.scrapingBeeBaseUrl, {
+      params,
+      timeout,
+      headers,
+      responseType: 'text',
+    });
     return res.data;
   }
 
-  /* ---------------------------
-   * Normalization & utils
-   * --------------------------- */
+  // -----------------------------
+  // Helpers / Normalization
+  // -----------------------------
+
   detectCurrency(price = '') {
     if (/[£]/.test(price)) return 'GBP';
     if (/[$]/.test(price)) return 'USD';
@@ -95,17 +123,15 @@ class ScrapingService {
     description = '',
     postedAt = null,
     location = '',
-    currency = null,
+    currency,
   }) {
     if (!title || !link) return null;
-
     const cleanedPrice = this.cleanPrice(price || '');
     return {
       title: this.cleanTitle(title),
       price: cleanedPrice,
       currency: currency || this.detectCurrency(cleanedPrice),
       link,
-      url: link, // expose both for upstream
       image: image || '',
       source,
       description: description || this.cleanTitle(title),
@@ -116,7 +142,7 @@ class ScrapingService {
 
   improveEbayImageUrl(url, $item) {
     if (!url && $item) {
-      const srcset = $item.find('.s-item__image img').attr('srcset');
+      const srcset = $item.find('.s-item__image img, img').attr('srcset');
       if (srcset) {
         const candidates = srcset.split(',').map((s) => s.trim().split(' ')[0]);
         const highRes =
@@ -126,7 +152,7 @@ class ScrapingService {
           candidates[candidates.length - 1];
         if (highRes) return highRes;
       }
-      const dataSrc = $item.find('.s-item__image img').attr('data-src');
+      const dataSrc = $item.find('.s-item__image img, img').attr('data-src');
       if (dataSrc) return dataSrc;
       return url;
     }
@@ -149,139 +175,29 @@ class ScrapingService {
     });
   }
 
-  /* ---------------------------
-   * eBay (RSS-first + HTML fallback)
-   * --------------------------- */
-  async searchEbay(searchTerm, location = 'UK', maxPages = 1) {
-    try {
-      logger.info(`🛒 eBay: "${searchTerm}" (loc=${location})`);
-
-      // 1) RSS (direct to eBay; fast)
-      const rssItems = await this._searchEbayRSS(searchTerm, 1);
-      if (rssItems.length) {
-        logger.info(`✅ eBay (RSS): ${rssItems.length} items`);
-        return rssItems.slice(0, 60);
-      }
-      logger.warn('eBay RSS returned 0; trying HTML fallback.');
-
-      // 2) HTML fallback via ScrapingBee
-      const listings = [];
-      for (let p = 1; p <= Math.max(1, maxPages); p++) {
-        // Keep query minimal; some flags like LH_PrefLoc can zero results for anon users
-        const url = `https://www.ebay.co.uk/sch/i.html?_nkw=${encodeURIComponent(
-          searchTerm
-        )}&rt=nc&_ipg=60&_pgn=${p}`;
-
-        // pass 1: no-JS (fast)
-        let $ = await this.fetchHTML(url, {
-          render_js: false,
-          premium_proxy: true,
-          block_resources: false,
-          headers: {
-            'Accept-Language': 'en-GB,en;q=0.9',
-            'User-Agent':
-              'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36',
-          },
-          timeout: 12000,
-        });
-
-        let found = this._collectEbayFromPage($, listings);
-
-        // pass 2: JS (if nothing matched)
-        if (found === 0) {
-          $ = await this.fetchHTML(url, {
-            render_js: true,
-            wait: 2500,
-            premium_proxy: true,
-            block_resources: true,
-            headers: {
-              'Accept-Language': 'en-GB,en;q=0.9',
-              'User-Agent':
-                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36',
-            },
-            timeout: 16000,
-          });
-          found = this._collectEbayFromPage($, listings);
-        }
-      }
-
-      logger.info(`✅ eBay (HTML): ${listings.length} items`);
-      return listings.slice(0, 60);
-    } catch (error) {
-      logger.error(`❌ eBay error "${searchTerm}"`, this._errInfo(error));
-      return [];
-    }
-  }
-
-  _collectEbayFromPage($, bucket) {
-    let found = 0;
-
-    // Primary modern container
-    const rows = $('ul.srp-results > li.s-item, li.s-item');
-    rows.each((_, el) => {
-      const $item = $(el);
-
-      // different title/link spots
-      const a =
-        $item.find('a.s-item__link').first() ||
-        $item.find('[data-testid="item-card-title"] a').first() ||
-        $item.find('a[href*="/itm/"]').first();
-
-      const title =
-        $item.find('h3.s-item__title').first().text().trim() ||
-        $item.find('[data-testid="item-card-title"] a').first().text().trim() ||
-        $item.find('h3,h2').first().text().trim();
-
-      const link = a.attr('href');
-      const price =
-        $item.find('.s-item__price').first().text().trim() ||
-        $item.find('[data-testid="item-card-price"]').first().text().trim();
-
-      let image =
-        $item.find('img.s-item__image-img').attr('src') ||
-        $item.find('img.s-item__image-img').attr('data-src') ||
-        $item.find('img').attr('src');
-
-      if (!title || !link) return;
-
-      image = this.improveEbayImageUrl(image, $item);
-      image = this.upgradeEbayImage(image);
-
-      const locationText =
-        $item.find('.s-item__location, .s-item__itemLocation').text().trim() || 'United Kingdom';
-
-      const norm = this.normalize({
-        title,
-        price,
-        link,
-        image,
-        source: 'ebay',
-        description: title,
-        location: locationText,
-      });
-      if (norm) {
-        bucket.push(norm);
-        found++;
-      }
-    });
-
-    return found;
-  }
+  // -----------------------------
+  // eBay
+  // -----------------------------
 
   async _searchEbayRSS(searchTerm, page = 1) {
     try {
-      const url = `https://www.ebay.co.uk/sch/i.html?_nkw=${encodeURIComponent(searchTerm)}&_sop=12&_pgn=${page}&_rss=1`;
-      const { data } = await axios.get(url, {
+      const url = `https://www.ebay.co.uk/sch/i.html?_nkw=${encodeURIComponent(searchTerm)}&_sop=12&_pgn=${page}&rt=nc&_rss=1`;
+
+      // Fetch via ScrapingBee so region is GB
+      const xml = await this.fetchText(url, {
+        render_js: false,
+        premium_proxy: true,
+        block_resources: true,
         headers: {
           Accept: 'application/rss+xml, application/xml;q=0.9, */*;q=0.8',
           'Accept-Language': 'en-GB,en;q=0.9',
           'User-Agent':
             'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36',
         },
-        timeout: 10000,
+        timeout: 12000,
       });
 
-      const $ = cheerio.load(data, { xmlMode: true });
+      const $ = cheerio.load(xml, { xmlMode: true });
       const items = [];
       $('item').each((_, el) => {
         const $el = $(el);
@@ -309,14 +225,149 @@ class ScrapingService {
 
       return items;
     } catch (e) {
-      logger.warn('eBay RSS failed:', { message: e?.message, code: e?.code, status: e?.response?.status });
+      logger.warn('eBay RSS failed', { message: e?.message, code: e?.code, status: e?.response?.status });
       return [];
     }
   }
 
-  /* ---------------------------
-   * Gumtree
-   * --------------------------- */
+  _collectEbayFromPage($, listings) {
+    let found = 0;
+
+    // Try common item wrappers
+    const candidates = $('.s-item, [data-testid="item"], li.s-item__pl-on-bottom, div.s-item__wrapper');
+    candidates.each((_, el) => {
+      const $item = $(el);
+      let title =
+        $item.find('.s-item__title').text().trim() ||
+        $item.find('[data-testid="listing-title"]').text().trim() ||
+        $item.find('h3,h2').first().text().trim();
+
+      let link =
+        $item.find('a.s-item__link').attr('href') ||
+        $item.find('a[href*="/itm/"]').attr('href') ||
+        $item.find('a').attr('href');
+
+      let price =
+        $item.find('.s-item__price').text().trim() ||
+        $item.find('[data-testid="listing-price"]').text().trim() ||
+        $item.find('.x-textrange__value').text().trim();
+
+      let image =
+        $item.find('img.s-item__image-img').attr('src') ||
+        $item.find('.s-item__image img').attr('src') ||
+        $item.find('img').attr('src') ||
+        '';
+
+      image = this.improveEbayImageUrl(image, $item);
+      image = this.upgradeEbayImage(image);
+
+      if (!title || !link) return;
+
+      const norm = this.normalize({
+        title,
+        price,
+        link,
+        image,
+        source: 'ebay',
+        description: title,
+        location: 'United Kingdom',
+      });
+
+      if (norm) {
+        listings.push(norm);
+        found++;
+      }
+    });
+
+    return found;
+    }
+
+  async searchEbay(searchTerm, location = 'UK', maxPages = 1) {
+    try {
+      logger.info(`🛒 eBay: "${searchTerm}" (loc=${location})`);
+
+      // 1) RSS first (via ScrapingBee / GB)
+      const rssItems = await this._searchEbayRSS(searchTerm, 1);
+      if (rssItems.length) {
+        logger.info(`✅ eBay (RSS): ${rssItems.length} items`);
+        return rssItems.slice(0, 60);
+      }
+      logger.warn('eBay RSS returned 0; trying HTML fallback.');
+
+      // 2) HTML fallbacks
+      const listings = [];
+      for (let p = 1; p <= Math.max(1, maxPages); p++) {
+        const url = `https://www.ebay.co.uk/sch/i.html?_nkw=${encodeURIComponent(
+          searchTerm
+        )}&rt=nc&_ipg=60&_pgn=${p}`;
+
+        // Pass 1: desktop UA, no JS
+        let $ = await this.fetchHTML(url, {
+          render_js: false,
+          premium_proxy: true,
+          block_resources: false,
+          headers: {
+            'Accept-Language': 'en-GB,en;q=0.9',
+            'User-Agent':
+              'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36',
+          },
+          timeout: 12000,
+        });
+        let found = this._collectEbayFromPage($, listings);
+
+        // Pass 2: desktop UA + JS
+        if (found === 0) {
+          $ = await this.fetchHTML(url, {
+            render_js: true,
+            wait: 2200,
+            premium_proxy: true,
+            block_resources: true,
+            headers: {
+              'Accept-Language': 'en-GB,en;q=0.9',
+              'User-Agent':
+                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36',
+            },
+            timeout: 16000,
+          });
+          found = this._collectEbayFromPage($, listings);
+        }
+
+        // Pass 3: mobile UA (often bypasses heavy shell)
+        if (found === 0) {
+          $ = await this.fetchHTML(url, {
+            render_js: false,
+            premium_proxy: true,
+            block_resources: false,
+            headers: {
+              'Accept-Language': 'en-GB,en;q=0.9',
+              'User-Agent':
+                'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
+            },
+            timeout: 12000,
+          });
+          found = this._collectEbayFromPage($, listings);
+        }
+
+        // If still zero, dump a tiny diagnostic sample once
+        if (found === 0 && p === 1) {
+          try {
+            const htmlSample = $.html().slice(0, 600).replace(/\s+/g, ' ').trim();
+            logger.warn('eBay HTML sample (first 600 chars): ' + htmlSample);
+          } catch {}
+        }
+      }
+
+      logger.info(`✅ eBay (HTML): ${listings.length} items`);
+      return listings.slice(0, 60);
+    } catch (error) {
+      logger.error(`❌ eBay error "${searchTerm}"`, this._errInfo(error));
+      return [];
+    }
+  }
+
+  // -----------------------------
+  // Gumtree
+  // -----------------------------
   async searchGumtree(searchTerm, location = 'UK', maxPages = 1) {
     try {
       logger.info(`🌳 Gumtree: "${searchTerm}" (loc=${location})`);
@@ -332,7 +383,7 @@ class ScrapingService {
         )}&page=${p}`;
         if (location && location !== 'UK') url += `&search_location=${encodeURIComponent(location)}`;
 
-        const $ = await this.fetchHTML(url, { render_js: true, premium_proxy: true, timeout: 15000 });
+        const $ = await this.fetchHTML(url, { render_js: true, premium_proxy: true });
 
         $('[data-q="search-result"], .listing-link, .listing-item, [data-q="listing"]').each((_, el) => {
           const $item = $(el);
@@ -366,9 +417,9 @@ class ScrapingService {
     }
   }
 
-  /* ---------------------------
-   * Facebook Marketplace
-   * --------------------------- */
+  // -----------------------------
+  // Facebook Marketplace
+  // -----------------------------
   async searchFacebookMarketplace(searchTerm, location = 'UK', maxPages = 1) {
     try {
       logger.info(`📘 Facebook: "${searchTerm}" (loc=${location})`);
@@ -381,11 +432,18 @@ class ScrapingService {
       const url = `https://www.facebook.com/marketplace/search/?query=${encodeURIComponent(
         searchTerm
       )}&exact=false`;
-      const $ = await this.fetchHTML(url, { render_js: true, premium_proxy: true, wait: 2200, timeout: 16000 });
+      const $ = await this.fetchHTML(url, {
+        render_js: true,
+        premium_proxy: true,
+        wait: 2200,
+        headers: {
+          'Accept-Language': 'en-GB,en;q=0.9',
+          'User-Agent':
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36',
+        },
+      });
 
-      let count = 0;
       $('a[href*="/marketplace/item/"]').each((_, a) => {
-        if (count >= 30) return false; // cap to keep searches fast
         const linkRaw = a.attribs?.href || '';
         let link = linkRaw.startsWith('/') ? `https://www.facebook.com${linkRaw}` : linkRaw;
 
@@ -399,11 +457,14 @@ class ScrapingService {
           .trim();
         const image = card.find('img').attr('src');
 
-        const norm = this.normalize({ title, price, link, image, source: 'facebook' });
-        if (norm) {
-          listings.push(norm);
-          count++;
-        }
+        const norm = this.normalize({
+          title,
+          price,
+          link,
+          image,
+          source: 'facebook',
+        });
+        if (norm) listings.push(norm);
       });
 
       logger.info(`✅ Facebook: ${listings.length} items`);
@@ -414,9 +475,9 @@ class ScrapingService {
     }
   }
 
-  /* ---------------------------
-   * CashConverters
-   * --------------------------- */
+  // -----------------------------
+  // CashConverters
+  // -----------------------------
   async searchCashConverters(searchTerm, location = 'UK', maxPages = 1) {
     try {
       logger.info(`💰 CashConverters: "${searchTerm}" (loc=${location})`);
@@ -430,20 +491,14 @@ class ScrapingService {
         const url = `https://www.cashconverters.co.uk/search?q=${encodeURIComponent(searchTerm)}${
           p > 1 ? `&page=${p}` : ''
         }`;
-        const $ = await this.fetchHTML(url, { render_js: true, premium_proxy: true, timeout: 15000 });
+        const $ = await this.fetchHTML(url, { render_js: true, premium_proxy: true });
 
-        const cards = $('[data-testid="product-card"], .product-card, .c-product-card, .product, .product-tile');
-        cards.each((_, el) => {
+        $('.product-tile, .product').each((_, el) => {
           const $item = $(el);
-          const a = $item.find('a').first();
-          let link = a.attr('href');
-          const title =
-            $item.find('h3, .title, [data-testid="product-title"], .product-title, .product-name').first().text().trim() ||
-            a.text().trim();
-          const price = $item.find('.price, [data-testid="product-price"], .product-price').first().text().trim();
-          const image =
-            $item.find('img').attr('src') || $item.find('img').attr('data-src') || $item.find('img').attr('data-lazy');
-
+          const title = $item.find('.product-title, .product-name').text().trim();
+          const price = $item.find('.product-price, .price').text().trim();
+          let link = $item.find('a').attr('href');
+          const image = $item.find('img').attr('src') || $item.find('img').attr('data-src');
           if (link && link.startsWith('/')) link = `https://www.cashconverters.co.uk${link}`;
 
           const norm = this.normalize({
@@ -466,18 +521,214 @@ class ScrapingService {
     }
   }
 
-  /* ---------------------------
-   * Optional sources
-   * --------------------------- */
-  async searchVinted() { return []; } // unchanged (disabled)
-  async searchDepop()  { return []; } // unchanged (disabled)
-  async searchDiscogs(){ return []; } // unchanged (disabled)
-  async searchGoogleShopping(){ return []; } // unchanged (disabled)
-  async searchGoogleResults(){ return []; } // unchanged (disabled)
+  // -----------------------------
+  // OPTIONAL SOURCES
+  // -----------------------------
+  async searchVinted(searchTerm, location = 'UK', maxPages = 1) {
+    try {
+      logger.info(`🧥 Vinted: "${searchTerm}"`);
+      if (!this.scrapingBeeApiKey) return [];
 
-  /* ---------------------------
-   * Utils
-   * --------------------------- */
+      const listings = [];
+      for (let p = 1; p <= Math.max(1, maxPages); p++) {
+        const url = `https://www.vinted.co.uk/catalog?search_text=${encodeURIComponent(
+          searchTerm
+        )}&page=${p}`;
+        const $ = await this.fetchHTML(url, { render_js: true, premium_proxy: true });
+
+        const html = $.html();
+        const m = html.match(/window\.__NUXT__\s*=\s*(\{.*?\});/);
+        if (m) {
+          try {
+            const nuxt = JSON.parse(m[1]);
+            const products = nuxt?.state?.products || [];
+            for (const prod of products) {
+              const norm = this.normalize({
+                title: prod.title || prod.name,
+                price: String(prod?.price?.amount || prod.price || ''),
+                link: prod.url ? `https://www.vinted.co.uk${prod.url}` : null,
+                image: prod?.photo?.url || prod?.image,
+                source: 'vinted',
+                description: prod?.description || '',
+              });
+              if (norm) listings.push(norm);
+            }
+            continue;
+          } catch { /* ignore */ }
+        }
+
+        $('[data-testid="item-box"]').each((_, el) => {
+          const aHref = $(el).find('a').attr('href');
+          const link = aHref ? `https://www.vinted.co.uk${aHref}` : null;
+          const title = $(el).find('[data-testid="item-title"]').text().trim();
+          const price = $(el).find('[data-testid="item-price"]').text().trim();
+          const image = $(el).find('img').attr('src');
+          const norm = this.normalize({ title, price, link, image, source: 'vinted' });
+          if (norm) listings.push(norm);
+        });
+      }
+      logger.info(`✅ Vinted: ${listings.length} items`);
+      return listings.slice(0, 60);
+    } catch (error) {
+      logger.error(`❌ Vinted error "${searchTerm}"`, this._errInfo(error));
+      return [];
+    }
+  }
+
+  async searchDepop(searchTerm, location = 'UK', maxPages = 1) {
+    try {
+      logger.info(`🧢 Depop: "${searchTerm}"`);
+      if (!this.scrapingBeeApiKey) return [];
+
+      const listings = [];
+      for (let p = 1; p <= Math.max(1, maxPages); p++) {
+        const url = `https://www.depop.com/search/?q=${encodeURIComponent(searchTerm)}&page=${p}`;
+        const $ = await this.fetchHTML(url, { render_js: true, premium_proxy: true });
+
+        $('a[href^="/products/"]').each((_, a) => {
+          const link = `https://www.depop.com${a.attribs?.href || ''}`;
+          const card = $(a).parent();
+          const title = card.find('p').first().text().trim();
+          const price = card
+            .find('span')
+            .filter((i, el) => /[£$€]\s*\d/.test($(el).text()))
+            .first()
+            .text()
+            .trim();
+          const image = card.find('img').attr('src');
+          const norm = this.normalize({ title, price, link, image, source: 'depop' });
+          if (norm) listings.push(norm);
+        });
+      }
+      logger.info(`✅ Depop: ${listings.length} items`);
+      return listings.slice(0, 60);
+    } catch (error) {
+      logger.error(`❌ Depop error "${searchTerm}"`, this._errInfo(error));
+      return [];
+    }
+  }
+
+  async searchDiscogs(searchTerm, location = 'UK', maxPages = 1) {
+    try {
+      logger.info(`💿 Discogs: "${searchTerm}"`);
+      if (!this.scrapingBeeApiKey) return [];
+
+      const listings = [];
+      for (let p = 1; p <= Math.max(1, maxPages); p++) {
+        const url = `https://www.discogs.com/sell/list?format=all&currency=GBP&q=${encodeURIComponent(
+          searchTerm
+        )}&page=${p}`;
+        const $ = await this.fetchHTML(url, { render_js: false, premium_proxy: true });
+
+        $('table#pjax_container tbody tr').each((_, tr) => {
+          const title = $(tr).find('td.item_description a.item_description_title').text().trim();
+          const link = 'https://www.discogs.com' + ($(tr).find('td.item_description a').attr('href') || '');
+          const price = $(tr).find('td.price').text().trim();
+          const image =
+            $(tr).find('td.image img').attr('data-src') || $(tr).find('td.image img').attr('src');
+          const norm = this.normalize({ title, price, link, image, source: 'discogs' });
+          if (norm) listings.push(norm);
+        });
+      }
+      logger.info(`✅ Discogs: ${listings.length} items`);
+      return listings.slice(0, 60);
+    } catch (error) {
+      logger.error(`❌ Discogs error "${searchTerm}"`, this._errInfo(error));
+      return [];
+    }
+  }
+
+  async searchGoogleShopping(searchTerm, location = 'UK', maxPages = 1) {
+    try {
+      logger.info(`🛍️ Google Shopping: "${searchTerm}"`);
+      if (!this.scrapingBeeApiKey) return [];
+
+      const listings = [];
+      for (let p = 0; p < Math.min(1, maxPages); p++) {
+        const url = `https://www.google.com/search?tbm=shop&q=${encodeURIComponent(
+          searchTerm
+        )}&hl=en-GB&gl=gb`;
+        const $ = await this.fetchHTML(url, { render_js: true, premium_proxy: true });
+
+        $('a[href^="/shopping/product/"]').each((_, a) => {
+          const link = `https://www.google.com${a.attribs?.href || ''}`;
+          const card = $(a).closest('div');
+          const title = $(a).text().trim();
+          const price = card
+            .find('span')
+            .filter((i, el) => /[£$€]\s*\d/.test($(el).text()))
+            .first()
+            .text()
+            .trim();
+          const image = card.find('img').attr('src');
+          const norm = this.normalize({ title, price, link, image, source: 'googleShopping' });
+          if (norm) listings.push(norm);
+        });
+      }
+      logger.info(`✅ Google Shopping: ${listings.length} items`);
+      return listings.slice(0, 40);
+    } catch (error) {
+      logger.error(`❌ Google Shopping error "${searchTerm}"`, this._errInfo(error));
+      return [];
+    }
+  }
+
+  async searchGoogleResults(searchTerm, location = 'UK', maxPages = 1) {
+    try {
+      logger.info(`🔎 Google Results: "${searchTerm}"`);
+      if (!this.scrapingBeeApiKey) return [];
+
+      const listings = [];
+      for (let p = 0; p < Math.max(1, maxPages); p++) {
+        const start = p * 10;
+        const url = `https://www.google.com/search?q=${encodeURIComponent(
+          searchTerm
+        )}&num=10&start=${start}&hl=en-GB&gl=gb`;
+        const $ = await this.fetchHTML(url, { render_js: true, premium_proxy: true });
+
+        $('div.g').each((_, el) => {
+          const a = $(el).find('a').first();
+          const link = a.attr('href');
+          const title = $(el).find('h3').first().text().trim();
+          const snippet =
+            $(el).find('div[data-sncf]').text().trim() ||
+            $(el).find('.VwiC3b').text().trim() ||
+            $(el).find('.aCOpRe').text().trim() ||
+            '';
+
+          if (!link || !title) return;
+
+          const hay = `${title} ${snippet}`.toLowerCase();
+          if (
+            !/(for sale|buy now|price|£|\$|€|in stock|add to cart|listing|shop|store|gumtree|ebay|facebook|depop|vinted|discogs|reverb)/.test(
+              hay
+            )
+          ) {
+            return;
+          }
+
+          const norm = this.normalize({
+            title,
+            price: '',
+            link,
+            image: '',
+            source: 'googleResults',
+            description: snippet,
+          });
+          if (norm) listings.push(norm);
+        });
+      }
+      logger.info(`✅ Google Results: ${listings.length} items`);
+      return listings.slice(0, 40);
+    } catch (error) {
+      logger.error(`❌ Google Results error "${searchTerm}"`, this._errInfo(error));
+      return [];
+    }
+  }
+
+  // -----------------------------
+  // Utils
+  // -----------------------------
   cleanTitle(title) {
     return String(title || '')
       .replace(/\s+/g, ' ')
@@ -506,13 +757,78 @@ class ScrapingService {
     };
   }
 
-  /* ---------------------------
-   * Mocks
-   * --------------------------- */
-  getMockGumtreeResults(searchTerm) { /* unchanged */ return []; }
-  getMockEbayResults(searchTerm)    { /* unchanged */ return []; }
-  getMockFacebookResults(searchTerm){ /* unchanged */ return []; }
-  getMockCashConvertersResults(st)  { /* unchanged */ return []; }
+  // -----------------------------
+  // Mocks
+  // -----------------------------
+  getMockGumtreeResults(searchTerm) {
+    return [
+      {
+        title: `${searchTerm} - Excellent Condition`,
+        price: '£150',
+        currency: 'GBP',
+        link: 'https://www.gumtree.com/p/mock-listing-1',
+        image: 'https://images.pexels.com/photos/1751731/pexels-photo-1751731.jpeg',
+        source: 'gumtree',
+        description: `Used ${searchTerm} in excellent condition`,
+        location: 'United Kingdom',
+      },
+      {
+        title: `${searchTerm} - Good Deal`,
+        price: '£120',
+        currency: 'GBP',
+        link: 'https://www.gumtree.com/p/mock-listing-2',
+        image: 'https://images.pexels.com/photos/1751731/pexels-photo-1751731.jpeg',
+        source: 'gumtree',
+        description: `Second-hand ${searchTerm} at great price`,
+        location: 'United Kingdom',
+      },
+    ];
+  }
+
+  getMockEbayResults(searchTerm) {
+    return [
+      {
+        title: `${searchTerm} - eBay Special`,
+        price: '£180',
+        currency: 'GBP',
+        link: 'https://www.ebay.com/itm/mock-listing-1',
+        image: 'https://images.pexels.com/photos/1751731/pexels-photo-1751731.jpeg',
+        source: 'ebay',
+        description: `Pre-owned ${searchTerm} from eBay`,
+        location: 'United Kingdom',
+      },
+    ];
+  }
+
+  getMockFacebookResults(searchTerm) {
+    return [
+      {
+        title: `${searchTerm} - Facebook Find`,
+        price: '£100',
+        currency: 'GBP',
+        link: 'https://www.facebook.com/marketplace/item/mock-listing-1',
+        image: 'https://images.pexels.com/photos/1751731/pexels-photo-1751731.jpeg',
+        source: 'facebook',
+        description: `Great ${searchTerm} from Facebook Marketplace`,
+        location: 'United Kingdom',
+      },
+    ];
+  }
+
+  getMockCashConvertersResults(searchTerm) {
+    return [
+      {
+        title: `${searchTerm} - CashConverters Mock`,
+        price: '£99',
+        currency: 'GBP',
+        link: 'https://www.cashconverters.co.uk/mock-listing-1',
+        image: 'https://images.pexels.com/photos/1751731/pexels-photo-1751731.jpeg',
+        source: 'cashConverters',
+        description: `Mock listing for ${searchTerm} on CashConverters`,
+        location: 'United Kingdom',
+      },
+    ];
+  }
 }
 
 export const scrapingService = new ScrapingService();
