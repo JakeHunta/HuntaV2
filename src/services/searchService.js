@@ -6,7 +6,7 @@ import { logger } from '../utils/logger.js';
 
 /* ---------- config ---------- */
 const STRICT_MODE_DEFAULT = true;       // initial pass uses strict precision
-const MAX_TERMS = 4;                    // cap expansions to reduce drift
+const MAX_TERMS = 3;                    // cap expansions to reduce drift
 const MAX_RESULTS = 40;
 
 /* ---------- weights ---------- */
