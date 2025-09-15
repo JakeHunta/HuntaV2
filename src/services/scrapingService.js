@@ -23,6 +23,8 @@ class ScrapingService {
       wait = 0,
       premium_proxy = true,
       block_resources = true,
+      headers = {},
+      timeout = 60000,
     } = {}
   ) {
     if (!this.scrapingBeeApiKey) {
@@ -41,8 +43,37 @@ class ScrapingService {
 
     logger.info('🐝 ScrapingBee GET', { url, params: { ...params, api_key: '***' } });
 
-    const res = await axios.get(this.scrapingBeeBaseUrl, { params, timeout: 60000 });
+    const res = await axios.get(this.scrapingBeeBaseUrl, { params, timeout, headers });
+    // ScrapingBee returns text/HTML/XML in .data
     return cheerio.load(res.data);
+  }
+
+  /**
+   * Fetch raw text (no Cheerio) through ScrapingBee — handy for debugging
+   */
+  async fetchText(
+    url,
+    { render_js = false, wait = 0, premium_proxy = true, block_resources = true, headers = {}, timeout = 60000 } = {}
+  ) {
+    if (!this.scrapingBeeApiKey) throw new Error('SCRAPINGBEE_API_KEY missing');
+
+    const params = {
+      api_key: this.scrapingBeeApiKey,
+      url,
+      render_js: render_js ? 'true' : 'false',
+      premium_proxy: premium_proxy ? 'true' : 'false',
+      block_resources: block_resources ? 'true' : 'false',
+      country_code: this.countryCode,
+    };
+    if (wait) params.wait = String(wait);
+
+    logger.info('🐝 ScrapingBee GET (text)', { url, params: { ...params, api_key: '***' } });
+    const res = await axios.get(this.scrapingBeeApiKey ? this.scrapingBeeBaseUrl : url, {
+      params: this.scrapingBeeApiKey ? params : undefined,
+      timeout,
+      headers,
+    });
+    return res.data;
   }
 
   // -----------------------------
@@ -68,7 +99,6 @@ class ScrapingService {
   upgradeEbayImage(url = '') {
     if (!url) return url;
     return url.replace(/\/s-l\d+\.jpg(\?.*)?$/i, '/s-l500.jpg');
-    // If you want maximum quality, change to s-l1600.jpg
   }
 
   /**
@@ -83,6 +113,7 @@ class ScrapingService {
     description = '',
     postedAt = null,
     location = '',
+    currency = null,
   }) {
     if (!title || !link) return null;
 
@@ -90,13 +121,14 @@ class ScrapingService {
     return {
       title: this.cleanTitle(title),
       price: cleanedPrice,
-      currency: this.detectCurrency(cleanedPrice), // NEW
+      currency: currency || this.detectCurrency(cleanedPrice),
       link,
+      url: link, // expose both fields; upstream code may read url OR link
       image: image || '',
       source,
       description: description || this.cleanTitle(title),
       postedAt,
-      location, // NEW
+      location,
     };
   }
 
@@ -129,49 +161,72 @@ class ScrapingService {
   filterUKOnly(items = []) {
     const isUK = (txt = '') => this.isUKLocation(txt);
     return items.filter((it) => {
-      // currency must be GBP if present
       if (it.currency && it.currency !== 'GBP') return false;
-
-      // if we have a location string (esp. eBay), enforce it
       if (it.location && !isUK(it.location)) return false;
-
-      // UK-native sources are fine
       if (['gumtree', 'cashConverters'].includes(it.source)) return true;
-
-      // For others (facebook, depop, vinted, etc.), GBP filter above is usually enough
       return true;
     });
   }
 
   // -----------------------------
-  // eBay
+  // eBay (RSS-first + HTML fallback)
   // -----------------------------
   async searchEbay(searchTerm, location = 'UK', maxPages = 1) {
     try {
       logger.info(`🛒 eBay: "${searchTerm}" (loc=${location})`);
-      if (!this.scrapingBeeApiKey) {
-        logger.warn('⚠️ ScrapingBee key missing; returning mock eBay data');
-        return this.getMockEbayResults(searchTerm);
+      // 1) Try RSS (direct; faster and usually stable)
+      const rssItems = await this._searchEbayRSS(searchTerm, 1);
+      if (rssItems.length) {
+        logger.info(`✅ eBay (RSS): ${rssItems.length} items`);
+        return rssItems.slice(0, 60);
       }
+      logger.warn('eBay RSS returned 0; trying HTML fallback.');
 
+      // 2) HTML fallback via ScrapingBee
       const listings = [];
       for (let p = 1; p <= Math.max(1, maxPages); p++) {
         const url = `https://www.ebay.co.uk/sch/i.html?_nkw=${encodeURIComponent(
           searchTerm
-        )}&_sop=12&_fsrp=1&LH_PrefLoc=3&_pgn=${p}`;
-        const $ = await this.fetchHTML(url, { render_js: false, premium_proxy: true });
+        )}&_sop=12&_fsrp=1&LH_PrefLoc=3&_ipg=60&_pgn=${p}`;
 
-        $('.s-item').each((_, el) => {
+        // pass 1: no-JS
+        let $ = await this.fetchHTML(url, {
+          render_js: false,
+          premium_proxy: true,
+          block_resources: false,
+          headers: {
+            'Accept-Language': 'en-GB,en;q=0.9',
+            'User-Agent':
+              'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36',
+          },
+          timeout: 25000,
+        });
+
+        let found = 0;
+        $('.s-item, [data-testid="item-card"]').each((_, el) => {
           const $item = $(el);
-          const title = $item.find('.s-item__title').text().trim();
-          const price = $item.find('.s-item__price').text().trim();
-          const link = $item.find('.s-item__link').attr('href');
-          let image = $item.find('.s-item__image img').attr('src');
-          image = this.improveEbayImageUrl(image, $item);
-          image = this.upgradeEbayImage(image); // NEW: crisper thumbs
-          const locationText = $item.find('.s-item__location, .s-item__itemLocation').text().trim(); // NEW
+          const title =
+            $item.find('h3.s-item__title').text().trim() ||
+            $item.find('[data-testid="item-card-title"] a').text().trim();
+          let link =
+            $item.find('a.s-item__link').attr('href') ||
+            $item.find('[data-testid="item-card-title"] a').attr('href');
+          let price =
+            $item.find('.s-item__price').text().trim() ||
+            $item.find('[data-testid="item-card-price"]').text().trim();
+          let image =
+            $item.find('img.s-item__image-img').attr('src') ||
+            $item.find('img').attr('src');
 
-          if (!title || !link || /shop on ebay/i.test(title)) return;
+          if (!title || !link) return;
+          if (/shop on ebay/i.test(title)) return;
+
+          image = this.improveEbayImageUrl(image, $item);
+          image = this.upgradeEbayImage(image);
+
+          const locationText =
+            $item.find('.s-item__location, .s-item__itemLocation').text().trim() || 'United Kingdom';
+
           const norm = this.normalize({
             title,
             price,
@@ -179,16 +234,120 @@ class ScrapingService {
             image,
             source: 'ebay',
             description: title,
-            location: locationText, // NEW
+            location: locationText,
           });
-          if (norm) listings.push(norm);
+          if (norm) {
+            listings.push(norm);
+            found++;
+          }
         });
+
+        // if blocked / empty, retry with JS render
+        if (found === 0) {
+          $ = await this.fetchHTML(url, {
+            render_js: true,
+            wait: 3000,
+            premium_proxy: true,
+            block_resources: true,
+            headers: {
+              'Accept-Language': 'en-GB,en;q=0.9',
+              'User-Agent':
+                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36',
+            },
+            timeout: 30000,
+          });
+
+          $('.s-item, [data-testid="item-card"]').each((_, el) => {
+            const $item = $(el);
+            const title =
+              $item.find('h3.s-item__title').text().trim() ||
+              $item.find('[data-testid="item-card-title"] a').text().trim();
+            let link =
+              $item.find('a.s-item__link').attr('href') ||
+              $item.find('[data-testid="item-card-title"] a').attr('href');
+            let price =
+              $item.find('.s-item__price').text().trim() ||
+              $item.find('[data-testid="item-card-price"]').text().trim();
+            let image =
+              $item.find('img.s-item__image-img').attr('src') ||
+              $item.find('img').attr('src');
+
+            if (!title || !link) return;
+            if (/shop on ebay/i.test(title)) return;
+
+            image = this.improveEbayImageUrl(image, $item);
+            image = this.upgradeEbayImage(image);
+
+            const locationText =
+              $item.find('.s-item__location, .s-item__itemLocation').text().trim() || 'United Kingdom';
+
+            const norm = this.normalize({
+              title,
+              price,
+              link,
+              image,
+              source: 'ebay',
+              description: title,
+              location: locationText,
+            });
+            if (norm) listings.push(norm);
+          });
+        }
       }
 
-      logger.info(`✅ eBay: ${listings.length} items`);
+      logger.info(`✅ eBay (HTML): ${listings.length} items`);
       return listings.slice(0, 60);
     } catch (error) {
       logger.error(`❌ eBay error "${searchTerm}"`, this._errInfo(error));
+      return [];
+    }
+  }
+
+  /**
+   * eBay RSS helper (direct request, no ScrapingBee)
+   */
+  async _searchEbayRSS(searchTerm, page = 1) {
+    try {
+      const url = `https://www.ebay.co.uk/sch/i.html?_nkw=${encodeURIComponent(searchTerm)}&_sop=12&_pgn=${page}&_rss=1`;
+      const { data } = await axios.get(url, {
+        headers: {
+          Accept: 'application/rss+xml, application/xml;q=0.9, */*;q=0.8',
+          'Accept-Language': 'en-GB,en;q=0.9',
+          'User-Agent':
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36',
+        },
+        timeout: 15000,
+      });
+
+      const $ = cheerio.load(data, { xmlMode: true });
+      const items = [];
+      $('item').each((_, el) => {
+        const $el = $(el);
+        const title = $el.find('title').text().trim();
+        const link = $el.find('link').text().trim();
+        const desc = $el.find('description').text() || '';
+        const pubDate = $el.find('pubDate').text().trim();
+
+        const priceMatch = desc.match(/£\s?\d[\d,.]*/i);
+        const imgMatch = desc.match(/<img[^>]+src="([^"]+)"/i);
+        const image = imgMatch ? imgMatch[1] : '';
+
+        const norm = this.normalize({
+          title,
+          price: priceMatch ? priceMatch[0].replace(/\s+/g, '') : '',
+          link,
+          image: this.upgradeEbayImage(image),
+          source: 'ebay',
+          postedAt: pubDate || null,
+          location: 'United Kingdom',
+          currency: 'GBP',
+        });
+        if (norm) items.push(norm);
+      });
+
+      return items;
+    } catch (e) {
+      logger.warn('eBay RSS failed:', { message: e?.message, code: e?.code, status: e?.response?.status });
       return [];
     }
   }
@@ -257,7 +416,6 @@ class ScrapingService {
       }
 
       const listings = [];
-      // Marketplace is dynamic; pagination via next pages is unreliable—do 1 page best-effort
       const url = `https://www.facebook.com/marketplace/search/?query=${encodeURIComponent(
         searchTerm
       )}&exact=false`;
@@ -283,7 +441,6 @@ class ScrapingService {
           link,
           image,
           source: 'facebook',
-          // (optional) location: 'United Kingdom'
         });
         if (norm) listings.push(norm);
       });
@@ -314,21 +471,28 @@ class ScrapingService {
         }`;
         const $ = await this.fetchHTML(url, { render_js: true, premium_proxy: true });
 
-        $('.product-tile, .product').each((_, el) => {
+        // Try multiple modern selectors
+        const cards = $('[data-testid="product-card"], .product-card, .c-product-card, .product, .product-tile');
+        cards.each((_, el) => {
           const $item = $(el);
-          const title = $item.find('.product-title, .product-name').text().trim();
-          const price = $item.find('.product-price, .price').text().trim();
-          let link = $item.find('a').attr('href');
-          const image = $item.find('img').attr('src') || $item.find('img').attr('data-src');
-          if (link && link.startsWith('/')) link = `https://www.cashconverters.co.uk${link}`;
+          const a = $item.find('a').first();
+          let link = a.attr('href');
+          const title =
+            $item.find('h3, .title, [data-testid="product-title"], .product-title, .product-name').first().text().trim() ||
+            a.text().trim();
+          const price =
+            $item.find('.price, [data-testid="product-price"], .product-price').first().text().trim();
+          const image =
+            $item.find('img').attr('src') || $item.find('img').attr('data-src') || $item.find('img').attr('data-lazy');
 
+          if (link && link.startsWith('/')) link = `https://www.cashconverters.co.uk${link}`;
           const norm = this.normalize({
             title,
             price,
             link,
             image,
             source: 'cashConverters',
-            location: 'United Kingdom', // UK site hint
+            location: 'United Kingdom',
           });
           if (norm) listings.push(norm);
         });
@@ -403,7 +567,7 @@ class ScrapingService {
   async searchDepop(searchTerm, location = 'UK', maxPages = 1) {
     try {
       logger.info(`🧢 Depop: "${searchTerm}"`);
-    if (!this.scrapingBeeApiKey) return [];
+      if (!this.scrapingBeeApiKey) return [];
 
       const listings = [];
       for (let p = 1; p <= Math.max(1, maxPages); p++) {
@@ -421,7 +585,7 @@ class ScrapingService {
             .text()
             .trim();
           const image = card.find('img').attr('src');
-          const norm = this.normalize({ title, price, link, image, source: 'd epop' });
+          const norm = this.normalize({ title, price, link, image, source: 'depop' });
           if (norm) listings.push(norm);
         });
       }
@@ -469,7 +633,6 @@ class ScrapingService {
       if (!this.scrapingBeeApiKey) return [];
 
       const listings = [];
-      // Google is sensitive; keep pages low
       for (let p = 0; p < Math.min(1, maxPages); p++) {
         const url = `https://www.google.com/search?tbm=shop&q=${encodeURIComponent(
           searchTerm
@@ -524,7 +687,6 @@ class ScrapingService {
 
           if (!link || !title) return;
 
-          // Simple heuristic to keep likely product/listing pages
           const hay = `${title} ${snippet}`.toLowerCase();
           if (
             !/(for sale|buy now|price|£|\$|€|in stock|add to cart|listing|shop|store|gumtree|ebay|facebook|depop|vinted|discogs|reverb)/.test(
@@ -536,7 +698,7 @@ class ScrapingService {
 
           const norm = this.normalize({
             title,
-            price: '', // price unknown from SERP
+            price: '',
             link,
             image: '',
             source: 'googleResults',
