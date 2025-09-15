@@ -1,5 +1,6 @@
-// Hardened ScrapingBee wrapper: prevents base 404s and adds sane defaults
+// src/utils/scrapingBee.js
 import axios from "axios";
+
 const BEE_BASE = "https://app.scrapingbee.com/api/v1/";
 
 export async function scrapingBee({
@@ -11,7 +12,7 @@ export async function scrapingBee({
   country_code = "gb",
   headers = {},
   json_response = false,
-  timeout = 20000
+  timeout = 20000,
 }) {
   if (!url) throw new Error("ScrapingBee missing target url");
 
@@ -21,15 +22,11 @@ export async function scrapingBee({
     render_js: render_js ? "true" : "false",
     premium_proxy: premium_proxy ? "true" : "false",
     block_resources: block_resources ? "true" : "false",
-    country_code
+    country_code,
   };
   if (wait) params.wait = String(wait);
   if (json_response) params.json_response = "true";
 
   const res = await axios.get(BEE_BASE, { params, headers, timeout });
   return res.data;
-}
-
-    throw err;
-  }
 }
