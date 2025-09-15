@@ -1,4 +1,4 @@
-// Dedupe using URL origin + pathname (stable for FB item IDs, etc.)
+// src/utils/dedupe.js
 export function dedupeByUrlPath(items) {
   const seen = new Set();
   const out = [];
@@ -10,7 +10,7 @@ export function dedupeByUrlPath(items) {
       seen.add(key);
       out.push(it);
     } catch {
-      out.push(it); // if URL parsing fails, keep rather than over-drop
+      out.push(it);
     }
   }
   return out;
