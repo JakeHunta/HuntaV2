@@ -23,7 +23,6 @@ async function scrapeEbayRSS(query, page = 1) {
     const desc = it.querySelector("description")?.text || "";
     const guid = it.querySelector("guid")?.text?.trim();
     const pubDate = it.querySelector("pubDate")?.text?.trim();
-
     const priceMatch = desc.match(/£\s?\d[\d,.]*/i);
     const imgMatch = desc.match(/<img[^>]+src="([^"]+)"/i);
 
@@ -49,34 +48,32 @@ function parseEbayItemsFromHTML(root) {
     ...root.querySelectorAll("[data-testid='item-card']"),
   ];
 
-  return nodes
-    .map((el) => {
-      const link =
-        el.querySelector("a.s-item__link")?.getAttribute("href") ||
-        el.querySelector("[data-testid='item-card-title'] a")?.getAttribute("href");
-      const title =
-        el.querySelector("h3.s-item__title")?.text?.trim() ||
-        el.querySelector("[data-testid='item-card-title'] a")?.text?.trim();
-      const price =
-        el.querySelector(".s-item__price")?.text?.trim() ||
-        el.querySelector("[data-testid='item-card-price']")?.text?.trim();
-      const img =
-        el.querySelector("img.s-item__image-img")?.getAttribute("src") ||
-        el.querySelector("img")?.getAttribute("src");
+  return nodes.map((el) => {
+    const link =
+      el.querySelector("a.s-item__link")?.getAttribute("href") ||
+      el.querySelector("[data-testid='item-card-title'] a")?.getAttribute("href");
+    const title =
+      el.querySelector("h3.s-item__title")?.text?.trim() ||
+      el.querySelector("[data-testid='item-card-title'] a")?.text?.trim();
+    const price =
+      el.querySelector(".s-item__price")?.text?.trim() ||
+      el.querySelector("[data-testid='item-card-price']")?.text?.trim();
+    const img =
+      el.querySelector("img.s-item__image-img")?.getAttribute("src") ||
+      el.querySelector("img")?.getAttribute("src");
 
-      if (!link || !title) return null;
-      return {
-        id: link,
-        source: "ebay",
-        title,
-        url: link,
-        price: price || null,
-        image: img || null,
-        currency: "GBP",
-        location: "UK",
-      };
-    })
-    .filter(Boolean);
+    if (!link || !title) return null;
+    return {
+      id: link,
+      source: "ebay",
+      title,
+      url: link,
+      price: price || null,
+      image: img || null,
+      currency: "GBP",
+      location: "UK",
+    };
+  }).filter(Boolean);
 }
 
 export async function scrapeEbay(query, { page = 1 } = {}) {
@@ -92,9 +89,10 @@ export async function scrapeEbay(query, { page = 1 } = {}) {
     console.warn("eBay RSS failed; trying HTML fallback:", e?.message || e);
   }
 
-  // 2) HTML fallback
+  // 2) HTML fallback (via ScrapingBee)
   const url = `https://www.ebay.co.uk/sch/i.html?_nkw=${encodeURIComponent(query)}&_sop=12&_fsrp=1&LH_PrefLoc=3&_pgn=${page}`;
 
+  // try no-JS first (faster)
   let html = await scrapingBee({
     url,
     render_js: false,
