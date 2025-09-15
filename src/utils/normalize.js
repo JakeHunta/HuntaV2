@@ -1,24 +1,18 @@
-function normalizeTitle(t) {
-  return (t || '')
-    .replace(/\s+/g, ' ')
-    .replace(/[\u200B-\u200D\uFEFF]/g, '')
-    .trim();
-}
+export function normalizeListing(listing) {
+  if (!listing) return null;
+  const title = (listing.title || "").trim();
+  const url = listing.url;
+  if (!title || !url) return null;
 
-function normalizeCurrency(cur) {
-  if (!cur) return 'GBP';
-  const c = cur.toUpperCase();
-  if (['£', 'GBP'].includes(c)) return 'GBP';
-  if (['€', 'EUR'].includes(c)) return 'EUR';
-  if (['$', 'USD'].includes(c)) return 'USD';
-  return c;
-}
+  const price = listing.price ?? null;
+  const image = listing.image ?? null;
 
-function parsePostedAt(raw) {
-  // Accept ISO or relative text; fallback null
-  if (!raw) return null;
-  if (/^\d{4}-\d{2}-\d{2}/.test(raw)) return raw;
-  return null;
+  return {
+    ...listing,
+    title,
+    currency: listing.currency || "GBP",
+    location: listing.location || "UK",
+    // accept items with price OR image (FB/CC often omit one)
+    __ok: !!(url && title && (price || image)),
+  };
 }
-
-module.exports = { normalizeTitle, normalizeCurrency, parsePostedAt };
