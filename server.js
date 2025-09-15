@@ -20,33 +20,43 @@ const PORT = process.env.PORT || 3001;
 // Trust Render proxy (for rate limit / IPs)
 app.set('trust proxy', 1);
 
-// Middleware
-app.use(helmet());
+// MOST AGGRESSIVE CORS FIX - Apply to ALL responses
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  
+  // Allow all origins for now to fix the issue
+  res.header('Access-Control-Allow-Origin', origin || '*');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS, HEAD');
+  res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization, Cache-Control, Pragma');
+  res.header('Access-Control-Allow-Credentials', 'true');
+  res.header('Access-Control-Max-Age', '86400'); // 24 hours
+  
+  // Handle preflight requests
+  if (req.method === 'OPTIONS') {
+    console.log(`🔧 CORS preflight for ${req.path} from origin: ${origin}`);
+    return res.status(200).end();
+  }
+  
+  console.log(`🌐 CORS headers set for ${req.method} ${req.path} from origin: ${origin}`);
+  next();
+});
 
-// CORS - Updated to allow your frontend domain
-app.use(cors({
-  origin: [
-    'http://localhost:5173',
-    'http://localhost:3000',
-    'https://hunta.uk',
-    'https://*.netlify.app',
-    'https://*.netlify.com',
-    process.env.FRONTEND_ORIGIN
-  ].filter(Boolean), // Remove any undefined values
-  credentials: true,
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept'],
-  optionsSuccessStatus: 200 // For legacy browser support
+// Middleware
+app.use(helmet({
+  crossOriginResourcePolicy: { policy: "cross-origin" }
 }));
 
-// Explicit OPTIONS handler for preflight requests
-app.options('*', (req, res) => {
-  res.header('Access-Control-Allow-Origin', req.headers.origin || '*');
-  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept');
-  res.header('Access-Control-Allow-Credentials', 'true');
-  res.sendStatus(200);
-});
+// Additional CORS with express cors middleware
+app.use(cors({
+  origin: function (origin, callback) {
+    // Allow all origins for now
+    callback(null, true);
+  },
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'HEAD'],
+  allowedHeaders: ['Origin', 'X-Requested-With', 'Content-Type', 'Accept', 'Authorization', 'Cache-Control', 'Pragma'],
+  optionsSuccessStatus: 200
+}));
 
 // JSON
 app.use(express.json({ limit: '1mb' }));
@@ -54,15 +64,6 @@ app.use(express.json({ limit: '1mb' }));
 // Extend response timeout to reduce AbortError from frontend (UI can still abort earlier)
 app.use((req, res, next) => {
   res.setTimeout(65000); // 65s
-  next();
-});
-
-// Global CORS middleware to ensure all responses have CORS headers
-app.use((req, res, next) => {
-  res.header('Access-Control-Allow-Origin', req.headers.origin || '*');
-  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept');
-  res.header('Access-Control-Allow-Credentials', 'true');
   next();
 });
 
@@ -88,15 +89,11 @@ const logWithTimestamp = (level, message, data = {}) => {
 
 // Routes
 app.get('/', (req, res) => {
-  // Add CORS headers explicitly
-  res.header('Access-Control-Allow-Origin', req.headers.origin || '*');
-  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With');
-  
   res.json({
     name: 'Hunta Backend API',
-    version: '2.0.0',
+    version: '2.1.0',
     status: 'running',
+    cors: 'enabled-aggressive',
     endpoints: {
       'POST /search': 'Search for second-hand items',
       'GET /health': 'Health check',
@@ -108,11 +105,6 @@ app.get('/', (req, res) => {
 });
 
 app.get('/health', (req, res) => {
-  // Add CORS headers explicitly
-  res.header('Access-Control-Allow-Origin', req.headers.origin || '*');
-  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With');
-  
   res.json({
     status: 'healthy',
     timestamp: new Date().toISOString(),
@@ -125,11 +117,6 @@ app.get('/health', (req, res) => {
 });
 
 app.get('/user-stats', (req, res) => {
-  // Add CORS headers explicitly
-  res.header('Access-Control-Allow-Origin', req.headers.origin || '*');
-  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With');
-  
   res.json({
     uptimeSeconds: Math.floor(process.uptime()),
     totalSearches: userStats.totalSearches,
@@ -143,13 +130,10 @@ app.post('/', (req, res) => {
 
 // Search endpoint
 app.post('/search', async (req, res) => {
-  // Add CORS headers explicitly at the start
-  res.header('Access-Control-Allow-Origin', req.headers.origin || '*');
-  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With');
-  res.header('Access-Control-Allow-Credentials', 'true');
-  
   const startTime = Date.now();
+  
+  console.log(`🔍 Search request from origin: ${req.headers.origin}`);
+  
   try {
     const { search_term, location = 'UK', currency = 'GBP', sources, maxPages } = req.body || {};
 
@@ -195,6 +179,8 @@ app.post('/search', async (req, res) => {
       resultsCount: items.length,
       processingTimeMs: processingTime
     });
+
+    console.log(`✅ Sending response with ${items.length} items and CORS headers`);
 
     res.json({
       items,
@@ -281,7 +267,7 @@ app.listen(PORT, () => {
   logWithTimestamp('info', `🎯 Hunta Backend API started successfully on port ${PORT}`);
   console.log(`🔍 POST /search`);
   console.log(`🏥 GET  /health`);
-  console.log(`🌐 CORS enabled for: https://hunta.uk, localhost, and Netlify domains`);
+  console.log(`🌐 AGGRESSIVE CORS enabled - allowing ALL origins`);
 });
 
 export default app;
