@@ -54,12 +54,13 @@ function recencyScore(iso) {
   return 0.2;
 }
 
+// NOTE: accept BOTH link and url; build key from whichever exists
 function uniqKey(r) {
   const t = normalizeText(r?.title);
   const p = parsePriceNumber(r?.price);
-  const link = r?.link || '';
+  const href = r?.link || r?.url || '';
   let host = '';
-  try { host = new URL(link).hostname.replace(/^www\./, ''); } catch {}
+  try { host = new URL(href).hostname.replace(/^www\./, ''); } catch {}
   return `${t}::${p ?? 'na'}::${host}`;
 }
 
@@ -98,7 +99,8 @@ function isUKHost(host) {
  * Keep UK-only results when requested:
  *  - Prefer £/GBP prices
  *  - Prefer UK hosts (.co.uk/.uk or whitelisted)
- *  - Drop obvious $/€ unless host is clearly UK
+ *  - Facebook: allow regardless of price (ScrapingBee uses country_code=gb)
+ * FAIL-OPEN: caller will fall back to unfiltered if this returns []
  */
 function regionFilter(list, { location = 'UK', ukOnly = false } = {}) {
   const wantUK = ukOnly || String(location || '').toUpperCase() === 'UK';
@@ -106,17 +108,18 @@ function regionFilter(list, { location = 'UK', ukOnly = false } = {}) {
 
   const kept = [];
   for (const r of list) {
-    const host = hostnameOf(r.link || '');
+    const href = r.link || r.url || '';
+    const host = hostnameOf(href);
     const gbp = hasGBP(r.price);
     const usd = hasUSD(r.price);
     const eur = hasEUR(r.price);
     const ukHost = isUKHost(host);
 
+    // Facebook: already geo-scoped by ScrapingBee (gb)
+    if (host.endsWith('facebook.com')) { kept.push(r); continue; }
+
     // Hard allow if host looks UK and not clearly $/€
     if (ukHost && !(usd || eur)) { kept.push(r); continue; }
-
-    // Allow FB only if price shows GBP
-    if (/facebook\.com$/.test(host) && gbp) { kept.push(r); continue; }
 
     // Allow Discogs/Google only when GBP price visible
     if ((host === 'discogs.com' || host === 'google.com') && gbp) { kept.push(r); continue; }
@@ -131,13 +134,11 @@ function regionFilter(list, { location = 'UK', ukOnly = false } = {}) {
 
 /* ---------- PRECISION HELPERS (generic, category-agnostic) ---------- */
 
-// tokens we generally want to ignore as must-haves
 const COMMON_STOP = new Set([
   'the','a','an','and','or','with','for','of','to','in','on',
   'card','tcg','pokemon','pokémon','guitar','effects','pedal','amp','amps'
 ]);
 
-// Split query and pick core tokens (brand/model-ish); up to 3
 function extractCoreTokens(query) {
   const raw = N(query)
     .replace(/[’'`]/g, '')
@@ -147,10 +148,10 @@ function extractCoreTokens(query) {
 
   const scored = raw.map(t => {
     let score = 0;
-    if (/\d/.test(t)) score += 2;                 // digits → model-ish
-    if (/[.-]/.test(t)) score += 1;               // hyphen/dot variants
+    if (/\d/.test(t)) score += 2;
+    if (/[.-]/.test(t)) score += 1;
     if (t.length >= 4 && !COMMON_STOP.has(t)) score += 1;
-    if (/^[a-z]+[0-9]+[a-z0-9]*$/i.test(t)) score += 1; // alnum mixed
+    if (/^[a-z]+[0-9]+[a-z0-9]*$/i.test(t)) score += 1;
     return { t, score };
   });
 
@@ -164,27 +165,19 @@ function extractCoreTokens(query) {
     .map(x => x.t);
 }
 
-// Build regex variants for a token (handles ob-1 / ob1 / ob.1 / ob 1)
 function tokenRegexes(tok) {
   const safe = tok.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-
-  const flex = safe.replace(/[-.]/g, '[-. ]?'); // allow -, . or space or none
-  const joined = safe.replace(/[-. ]/g, '');    // remove separators
-
+  const flex = safe.replace(/[-.]/g, '[-. ]?');
+  const joined = safe.replace(/[-. ]/g, '');
   const arr = [
     new RegExp(`\\b${flex}\\b`, 'i'),
     new RegExp(`\\b${joined}\\b`, 'i')
   ];
-
-  if (!/[-.\s]/.test(tok)) {
-    arr.push(new RegExp(`\\b${safe}\\b`, 'i'));
-  }
-
+  if (!/[-.\s]/.test(tok)) arr.push(new RegExp(`\\b${safe}\\b`, 'i'));
   const seen = new Set();
   return arr.filter(r => (seen.has(String(r)) ? false : (seen.add(String(r)), true)));
 }
 
-// very generic excludes that often cause false positives
 const EXCLUDE_PATTERNS = [
   /\b(manual|instructions?|book(let)?|guide)\b/i,
   /\b(box\s*only|case\s*only|empty\s*box)\b/i,
@@ -198,7 +191,6 @@ function shouldExclude(title, desc) {
   return EXCLUDE_PATTERNS.some(re => re.test(hay));
 }
 
-// Optional: brand/model one-off helpers to reduce cross-model bleed for Strymon
 const STRYMON_MODELS = [
   'ob-1','ob1','ob 1',
   'compadre','timeline','bigsky','bluesky','blue sky','mobius','el capistan','capistan',
@@ -212,22 +204,16 @@ function detectBrand(q) {
   if (/\bpok[eé]mon\b/.test(s)) return 'pokemon';
   return null;
 }
-
 function detectTargetModel(q) {
   const s = N(q);
   if (/\bob[-.\s]?1\b/.test(s)) return 'ob-1';
   return null;
 }
 
-/**
- * Generic precision filter with strict/relaxed modes + a couple of light domain heuristics.
- */
 function precisionFilter(results, query, enhanced = null, opts = {}) {
   const strict = opts.strict ?? true;
-
   const core = extractCoreTokens(query);
 
-  // include a few single-word enhanced terms (avoid multi-word drift)
   const extras = Array.isArray(enhanced?.search_terms)
     ? enhanced.search_terms
         .map(N)
@@ -244,7 +230,7 @@ function precisionFilter(results, query, enhanced = null, opts = {}) {
 
   const brand = detectBrand(query);
   const targetModel = detectTargetModel(query);
-  const wantsSIR = /\bsir\b/i.test(query); // Pokémon SIR users expect SIR/Alt Art/SAR content
+  const wantsSIR = /\bsir\b/i.test(query);
 
   const out = [];
   for (const r of results) {
@@ -253,7 +239,6 @@ function precisionFilter(results, query, enhanced = null, opts = {}) {
     if (!title) continue;
     if (shouldExclude(title, desc)) continue;
 
-    // Count how many core tokens match in title / in title+desc
     let hitsTitle = 0, hitsRelaxed = 0;
     regsPerTok.forEach(regs => {
       if (regs.some(re => re.test(title))) hitsTitle += 1;
@@ -261,13 +246,12 @@ function precisionFilter(results, query, enhanced = null, opts = {}) {
     });
 
     if (strict) {
-      if (hitsTitle < minHitsTitle) continue; // require K matches in TITLE
+      if (hitsTitle < minHitsTitle) continue;
     } else {
       const total = hitsTitle + hitsRelaxed;
       if (!(hitsTitle >= Math.max(1, minHitsRelaxed - 1) || total >= minHitsRelaxed)) continue;
     }
 
-    // Strymon heuristic: if user requested OB-1, drop other Strymon models unless OB-1 present
     if (brand === 'strymon' && targetModel) {
       const hay = `${title} ${desc}`;
       const hasTarget = /\bob[-.\s]?1\b/.test(hay);
@@ -277,7 +261,6 @@ function precisionFilter(results, query, enhanced = null, opts = {}) {
       if (!hasTarget && mentionsOther) continue;
     }
 
-    // Pokémon SIR heuristic: if "SIR" in query, require SIR/Alt Art/SAR phrasing
     if (wantsSIR) {
       const hay = `${title} ${desc}`;
       const okSIR = /\bsir\b/.test(hay)
@@ -320,7 +303,6 @@ function toCountryCode(location = '') {
   if (['uk','gb','united kingdom','great britain','england','scotland','wales','northern ireland'].includes(s)) return 'gb';
   if (['us','usa','united states','america'].includes(s)) return 'us';
   if (['ie','ireland','eire'].includes(s)) return 'ie';
-  // default to GB
   return 'gb';
 }
 
@@ -369,7 +351,21 @@ class SearchService {
           limit(async () => {
             try {
               const out = await fn(t, location, options.maxPages || 1);
-              return Array.isArray(out) ? out.map(x => (x?.source ? x : { ...x, source: key })) : [];
+              // CRITICAL NORMALIZATION: make sure both link and url exist
+              return Array.isArray(out)
+                ? out
+                    .filter(Boolean)
+                    .map(x => {
+                      const link = x?.link || x?.url || '';
+                      const url  = x?.url  || x?.link || '';
+                      return {
+                        ...x,
+                        source: x?.source || key,
+                        link,  // ensure set for dedupe/region
+                        url,   // keep original too (frontend may expect url)
+                      };
+                    })
+                : [];
             } catch (e) {
               logger.warn(`[${key}] failed for "${t}": ${e?.message || e}`);
               return [];
@@ -378,6 +374,7 @@ class SearchService {
         );
       }
     }
+
     const settled = await Promise.all(jobs);
     let all = settled.flat().filter(Boolean);
 
@@ -390,18 +387,20 @@ class SearchService {
     const seen = new Set();
     const unique = [];
     for (const r of all) {
-      if (!r?.title || !r?.link) continue;
+      if (!r?.title) continue;
+      const href = r?.link || r?.url; // must have at least one
+      if (!href) continue;            // drop truly broken entries
       const key = uniqKey(r);
       if (seen.has(key)) continue;
       seen.add(key);
       unique.push({ ...r, priceAmount: parsePriceNumber(r.price) });
     }
 
-    // 5) Region filter (UK-only if requested by location or options.ukOnly)
-    const regioned = regionFilter(unique, { location, ukOnly: options.ukOnly === true });
-    if (!regioned.length) {
-      logger.info('ℹ️ Region filter removed all items; returning [].');
-      return [];
+    // 5) Region filter (FAIL-OPEN)
+    const regionedTry = regionFilter(unique, { location, ukOnly: options.ukOnly === true });
+    const regioned = regionedTry.length ? regionedTry : unique;
+    if (!regionedTry.length) {
+      logger.info('ℹ️ Region filter would remove all items — using unfiltered set.');
     }
 
     // 6) Precision filtering with automatic fallback (strict → relaxed → none)
@@ -414,13 +413,13 @@ class SearchService {
         filtered = relaxed;
         mode = 'relaxed';
       } else {
-        filtered = regioned; // give *something* rather than nothing
+        filtered = regioned; // give something rather than nothing
         mode = 'none';
       }
     }
 
     if (!filtered.length) {
-      logger.info(`ℹ️ precisionFilter produced 0 items (mode=${mode}); returning []`);
+      logger.info(`ℹ️ precisionFilter produced 0 items (mode=${mode}); returning [].`);
       return [];
     }
 
@@ -441,7 +440,7 @@ class SearchService {
       for (const t of qTerms) { if (t && title.includes(t)) m += 0.30; if (t && desc.includes(t)) m += 0.10; }
       for (const t of eTerms) { if (t && title.includes(t)) m += 0.15; if (t && desc.includes(t)) m += 0.05; }
       for (const c of cats)   { if (c && (title.includes(c) || desc.includes(c))) m += 0.10; }
-      if (title.includes(exactQ)) m += 0.20;                       // exact phrase boost
+      if (title.includes(exactQ)) m += 0.20;       // exact phrase boost
       if ((r.title || '').length < 20) m -= 0.05;
       if (r.image) m += 0.03;
 
