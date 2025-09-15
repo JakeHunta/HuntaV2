@@ -375,8 +375,12 @@ class SearchService {
       }
     }
 
-    const settled = await Promise.all(jobs);
-    let all = settled.flat().filter(Boolean);
+    // ✅ Use allSettled so one slow/failed source can't block the whole search
+    const settled = await Promise.allSettled(jobs);
+    let all = [];
+    for (const s of settled) {
+      if (s.status === 'fulfilled' && Array.isArray(s.value)) all.push(...s.value);
+    }
 
     if (!all.length) {
       logger.warn('⚠️ No results from any source');
@@ -398,11 +402,11 @@ class SearchService {
 
     // 5) Region filter (FAIL-OPEN)
     const regioned = regionFilter(unique, { location, ukOnly: options.ukOnly === true });
-if (!regioned.length) {
-  logger.info('ℹ️ Region filter removed all items; returning [].');
-  return [];
-}
-    
+    if (!regioned.length) {
+      logger.info('ℹ️ Region filter removed all items; returning [].');
+      return [];
+    }
+
     // 6) Precision filtering with automatic fallback (strict → relaxed → none)
     let filtered = precisionFilter(regioned, searchTerm, enhanced, { strict: strictRequested });
     let mode = strictRequested ? 'strict' : 'relaxed';
