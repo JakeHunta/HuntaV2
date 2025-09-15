@@ -1,11 +1,8 @@
 import { scrapingBee } from "../utils/scrapingBee.js";
 import { parse } from "node-html-parser";
 
-// Minimal example parser—adapt your selectors as needed
 export async function scrapeCashConverters(query) {
-  const url = `https://www.cashconverters.co.uk/search?q=${encodeURIComponent(
-    query
-  )}`;
+  const url = `https://www.cashconverters.co.uk/search?q=${encodeURIComponent(query)}`;
 
   try {
     const html = await scrapingBee({
@@ -19,51 +16,39 @@ export async function scrapeCashConverters(query) {
     });
 
     const root = parse(html);
-    // TODO: adjust selectors for CC layout. Placeholder:
     const cards = root.querySelectorAll("[data-testid='product-card'], .product-card, .c-product-card");
 
-    const items = cards
-      .map((el) => {
-        const a = el.querySelector("a");
-        const link = a?.getAttribute("href");
-        const title =
-          el.querySelector("h3, .title, [data-testid='product-title']")?.text?.trim() ||
-          a?.text?.trim();
-        const price =
-          el.querySelector(".price, [data-testid='product-price']")?.text?.trim() || null;
-        const img =
-          el.querySelector("img")?.getAttribute("src") ||
-          el.querySelector("img")?.getAttribute("data-src") ||
-          null;
+    const items = cards.map((el) => {
+      const a = el.querySelector("a");
+      const link = a?.getAttribute("href");
+      const title = el.querySelector("h3, .title, [data-testid='product-title']")?.text?.trim() || a?.text?.trim();
+      const price = el.querySelector(".price, [data-testid='product-price']")?.text?.trim() || null;
+      const img = el.querySelector("img")?.getAttribute("src") || el.querySelector("img")?.getAttribute("data-src") || null;
 
-        if (!link || !title) return null;
-        const absolute = link.startsWith("http")
-          ? link
-          : `https://www.cashconverters.co.uk${link}`;
-        return {
-          id: absolute,
-          source: "cashconverters",
-          title,
-          url: absolute,
-          price,
-          image: img,
-          currency: "GBP",
-          location: "UK",
-        };
-      })
-      .filter(Boolean);
+      if (!link || !title) return null;
+      const absolute = link.startsWith("http") ? link : `https://www.cashconverters.co.uk${link}`;
+      return {
+        id: absolute,
+        source: "cashconverters",
+        title,
+        url: absolute,
+        price,
+        image: img,
+        currency: "GBP",
+        location: "UK",
+      };
+    }).filter(Boolean);
 
     console.info(`✅ CashConverters: ${items.length} items`);
     return items;
   } catch (e) {
-    // If upstream (target) is 404, treat as empty results
     const beeStatus = e?.response?.status;
-    const data = e?.response?.data;
-    const original = data?.original_status;
+    const original = e?.response?.data?.original_status;
     if (beeStatus === 404 || original === 404) {
       console.warn("CashConverters 404 (treating as empty set).");
       return [];
     }
-    throw e;
+    console.warn("CashConverters error (non-404):", e?.message || e);
+    return []; // stay resilient in aggregate
   }
 }
