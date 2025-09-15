@@ -23,12 +23,20 @@ app.set('trust proxy', 1);
 // Middleware
 app.use(helmet());
 
+// CORS
 const allowedOrigin = process.env.FRONTEND_ORIGIN || '*';
 app.use(cors({ origin: allowedOrigin }));
 
+// JSON
 app.use(express.json({ limit: '1mb' }));
 
-// Basic global rate limit (adjust if needed)
+// Extend response timeout to reduce AbortError from frontend (UI can still abort earlier)
+app.use((req, res, next) => {
+  res.setTimeout(65000); // 65s
+  next();
+});
+
+// Basic global rate limit
 app.use(
   rateLimit({
     windowMs: 60 * 1000,
@@ -84,7 +92,6 @@ app.get('/user-stats', (req, res) => {
   });
 });
 
-// Helpful hint if someone POSTs to /
 app.post('/', (req, res) => {
   res.status(400).json({ error: 'Use POST /search instead of POST /' });
 });
@@ -116,9 +123,12 @@ app.post('/search', async (req, res) => {
       maxPages
     });
 
+    if (req.get('content-length') && Number(req.get('content-length')) > 0) {
+      logWithTimestamp('debug', 'Request body present', req.body);
+    }
+
     userStats.totalSearches++;
 
-    // Pass optional sources/maxPages to the service (safe to omit)
     const items = await searchService.performSearch(
       cleanSearchTerm,
       searchLocation,
@@ -134,7 +144,6 @@ app.post('/search', async (req, res) => {
       processingTimeMs: processingTime
     });
 
-    // Return both keys to avoid breaking any client
     res.json({
       items,
       listings: items,
@@ -223,3 +232,4 @@ app.listen(PORT, () => {
 });
 
 export default app;
+
