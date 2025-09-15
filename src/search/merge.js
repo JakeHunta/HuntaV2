@@ -1,3 +1,6 @@
+// src/search/merge.js
+console.info("🧩 merge.js loaded (region filter fail-open)");
+
 import { normalizeListing } from "../utils/normalize.js";
 import { dedupeByUrlPath } from "../utils/dedupe.js";
 import { filterByRegion } from "../filters/region.js";
