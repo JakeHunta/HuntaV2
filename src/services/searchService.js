@@ -397,12 +397,12 @@ class SearchService {
     }
 
     // 5) Region filter (FAIL-OPEN)
-    const regionedTry = regionFilter(unique, { location, ukOnly: options.ukOnly === true });
-    const regioned = regionedTry.length ? regionedTry : unique;
-    if (!regionedTry.length) {
-      logger.info('ℹ️ Region filter would remove all items — using unfiltered set.');
-    }
-
+    const regioned = regionFilter(unique, { location, ukOnly: options.ukOnly === true });
+if (!regioned.length) {
+  logger.info('ℹ️ Region filter removed all items; returning [].');
+  return [];
+}
+    
     // 6) Precision filtering with automatic fallback (strict → relaxed → none)
     let filtered = precisionFilter(regioned, searchTerm, enhanced, { strict: strictRequested });
     let mode = strictRequested ? 'strict' : 'relaxed';
